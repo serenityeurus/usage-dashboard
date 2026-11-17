@@ -23,7 +23,7 @@ export function loadConfig(environment = process.env) {
   }
   return {
     port: numberFromEnv(environment, 'PORT', 8787),
-    listenHost: environment.LISTEN_HOST || '0.0.0.0',
+    listenHost: environment.LISTEN_HOST || '127.0.0.1', // containers set 0.0.0.0 explicitly
     claudeProjectsDir: environment.CLAUDE_PROJECTS_DIR || path.join(process.env.HOME || '/', '.claude', 'projects'),
     pricingFilePath: environment.PRICING_FILE || path.join(RepoRoot, 'config', 'pricing.json'),
     publicDir: path.join(RepoRoot, 'public'),
