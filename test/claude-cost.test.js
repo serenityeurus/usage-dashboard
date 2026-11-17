@@ -4,7 +4,9 @@ import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { aggregateClaudeUsage } from '../src/providers/claude/aggregate.js';
 import { findModelRates, loadPricingTable, priceUsageRecord, validatePricingTable } from '../src/providers/claude/pricing.js';
+import { createClaudeProvider } from '../src/providers/claude/index.js';
 import { TranscriptScanner } from '../src/transcript-scanner.js';
+import { computeWindows } from '../src/windows.js';
 
 const TestDir = path.dirname(fileURLToPath(import.meta.url));
 const PricingPath = path.join(TestDir, '..', 'config', 'pricing.json');
@@ -106,6 +108,23 @@ describe('aggregateClaudeUsage on fixtures', () => {
     assert.equal(aggregate.sessionCount, 2);
     const tokenTypeCost = Object.values(aggregate.tokenTypes).reduce((sum, row) => sum + row.costUsd, 0);
     closeTo(tokenTypeCost, aggregate.totals.costUsd);
+  });
+
+  it('feeds unrounded per-day cost into the windows so they match the all-time total', async () => {
+    // Haiku input is $0.10/Mtok, so 3 tokens cost $0.0000003: rounding each day to
+    // 6 dp first gives 0 per day, while the true 3-day sum rounds to $0.000001.
+    const usageRecords = ['2026-11-14', '2026-11-15', '2026-11-16'].map((day, index) => ({
+      ...baseRecord, model: 'claude-haiku-5-5', inputTokens: 3, timestamp: `${day}T12:00:00Z`, sessionId: `s${index}`, projectDir: '-home-testuser-repos',
+    }));
+    const provider = createClaudeProvider({ pricingFilePath: PricingPath, adminKey: '', timeZone: 'UTC' });
+    const now = new Date('2026-11-16T18:00:00Z');
+    const { summary, timeSeries, detail } = await provider.collect({ now, reason: 'refresh', getTranscripts: async () => ({ usageRecords, stats: {} }) });
+    assert.equal(summary.costUsd, 0.000001);
+    const windows = computeWindows(timeSeries, { now, timeZone: 'UTC' });
+    assert.equal(windows.allTime.costUsd, summary.costUsd);
+    assert.equal(windows.last7Days.costUsd, summary.costUsd);
+    assert.deepEqual(detail.byDay.map((row) => row.costUsd), [0, 0, 0], 'detail rows stay rounded for display');
+    assert.equal(detail.byDayUnroundedCostUsd, undefined, 'internal helper must not leak into the API payload');
   });
 
   it('handles zero records', async () => {

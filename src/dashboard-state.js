@@ -8,16 +8,23 @@
 //   context.reason -> 'startup' | 'refresh'
 //   context.probes -> Set of explicitly requested paid probes (e.g. 'brave')
 // summary: { id, name, costUsd, costLabel, costKind ('actual'|'api-equivalent'|'estimated'),
-//            active?, primaryMetric{label,value}, secondaryMetrics[{label,value,unit?}], warnings[] }
+//            active?, activeProvider?{id,source,at}, hidden? (omit the tile, keep it in the total),
+//            primaryMetric{label,value}, secondaryMetrics[{label,value,unit?}], warnings[] }
 // timeSeries: { metrics: ['costUsd','tokens','searches','messages'], byDay: [{ day, ...metrics }] }
 //   When present, summary.windows (today / last7Days / allTime) is computed
 //   here and the provider is included in the "All platforms" total.
+//
+// Windows and the total are derived on every read (getSnapshot), not stored:
+// "today" depends on the clock, so values computed at refresh time go stale at
+// local midnight, and a failed provider's reused data would otherwise carry
+// windows computed against an old "now". The stored snapshot keeps only the
+// raw summaries and time series; the derivation is a few hundred additions.
 // detail:  provider-specific breakdown rendered by the provider's UI view.
 import { computeTotal } from './total.js';
 import { computeWindows } from './windows.js';
 
 export function createDashboardState({ providers, transcriptScanner, clock = () => new Date(), timeZone = 'UTC' }) {
-  let snapshot = { refreshedAt: null, durationMs: null, providers: {}, total: null };
+  let snapshot = { refreshedAt: null, durationMs: null, providers: {} };
   let refreshInFlight = null;
 
   async function runRefresh(reason, probes) {
@@ -37,10 +44,7 @@ export function createDashboardState({ providers, transcriptScanner, clock = () 
     const results = await Promise.all(providers.map(async (provider) => {
       try {
         const { summary, detail, timeSeries = null } = await provider.collect(context);
-        const windows = timeSeries ? computeWindows(timeSeries, { now, timeZone }) : undefined;
-        return [provider.id, {
-          ok: true, summary: windows ? { ...summary, windows } : summary, detail, timeSeries,
-        }];
+        return [provider.id, { ok: true, summary, detail, timeSeries }];
       } catch (error) {
         // One broken provider must not take down the dashboard.
         const previous = snapshot.providers[provider.id];
@@ -55,16 +59,33 @@ export function createDashboardState({ providers, transcriptScanner, clock = () 
       }
     }));
 
-    const providerEntries = Object.fromEntries(results);
     snapshot = {
       refreshedAt: now.toISOString(),
       refreshReason: reason,
       durationMs: Date.now() - startedAt,
       timeZone,
-      providers: providerEntries,
-      total: computeTotal(Object.values(providerEntries)),
+      providers: Object.fromEntries(results),
     };
-    return snapshot;
+    return currentView();
+  }
+
+  // The snapshot as of now: windows and total recomputed against clock().
+  function currentView() {
+    const now = clock();
+    const range = computeWindows(null, { now, timeZone }).range;
+    const providerEntries = Object.fromEntries(Object.entries(snapshot.providers).map(([providerId, entry]) => {
+      if (!entry.timeSeries) return [providerId, entry];
+      const windows = computeWindows(entry.timeSeries, { now, timeZone });
+      return [providerId, { ...entry, summary: { ...entry.summary, windows } }];
+    }));
+    let total = null;
+    if (snapshot.refreshedAt) {
+      total = computeTotal(Object.values(providerEntries));
+      total.summary.range = range;
+    }
+    return {
+      ...snapshot, timeZone, range, providers: providerEntries, total,
+    };
   }
 
   return {
@@ -82,7 +103,8 @@ export function createDashboardState({ providers, transcriptScanner, clock = () 
       refreshInFlight = { promise, probes: requestedProbes };
       return promise;
     },
-    getSnapshot: () => snapshot,
+    getSnapshot: currentView,
+    getRefreshedAt: () => snapshot.refreshedAt, // cheap: /healthz does not need windows
     isRefreshing: () => Boolean(refreshInFlight),
     providerIds: () => providers.map((provider) => provider.id),
   };

@@ -107,6 +107,9 @@ export function aggregateClaudeUsage(usageRecords, { pricingTable, timeZone, now
     totals: finalizeBucket(totals),
     monthToDate: { month: currentMonth, ...finalizeBucket(monthToDate) },
     byDay: toRows(byDay, 'day').sort((left, right) => left.day.localeCompare(right.day)),
+    // Unrounded per-day cost for the time windows: summing the 6-dp rounded
+    // rows above drifts from totals.costUsd, so windows sum these and round once.
+    byDayUnroundedCostUsd: Object.fromEntries([...byDay.entries()].map(([day, bucket]) => [day, bucket.costUsd])),
     byModel: toRows(byModel, 'model').sort((left, right) => right.costUsd - left.costUsd),
     byProject: toRows(byProject, 'project').sort((left, right) => right.costUsd - left.costUsd),
     tokenTypes: tokenTypeTotals,

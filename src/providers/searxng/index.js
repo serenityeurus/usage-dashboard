@@ -1,10 +1,10 @@
 // SearXNG provider adapter: self-hosted, key-free web_search backend.
 // Spend is always $0 (actual); the tile shows search volume and instance health.
-import { selectCallsForProvider } from '../../web-search-attribution.js';
+import { activeProviderMetrics, resolveActiveWebSearchProvider, selectCallsForProvider } from '../../web-search-attribution.js';
 import { aggregateWebSearchCalls, searchTimeSeries } from '../../web-search-history.js';
 import { checkSearxngHealth } from './health.js';
 
-export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSeconds = 5, active = false, attributionOptions = {} }) {
+export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSeconds = 5, webSearchProvider = null, attributionOptions = {} }) {
   return {
     id: 'searxng',
     name: 'SearXNG',
@@ -14,6 +14,8 @@ export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSec
         checkSearxngHealth({ baseUrl, fetchImpl, timeoutSeconds }),
       ]);
       const { calls, attribution } = selectCallsForProvider(transcripts.webSearchCalls, 'searxng', attributionOptions);
+      const activeProvider = resolveActiveWebSearchProvider(webSearchProvider, transcripts.webSearchCalls);
+      const active = activeProvider.id === 'searxng';
       const history = aggregateWebSearchCalls(calls, { timeZone, costPer1k: 0, monthlyCreditUsd: 0, now: context.now });
 
       let healthLabel = 'not configured';
@@ -27,6 +29,7 @@ export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSec
           id: 'searxng',
           name: 'SearXNG',
           active,
+          activeProvider,
           costKind: 'actual',
           costLabel: 'Spend (self-hosted, free)',
           costUsd: 0,
@@ -34,6 +37,7 @@ export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSec
           secondaryMetrics: [
             { label: `Searches ${history.monthToDate.month}`, value: history.monthToDate.count },
             { label: 'Instance health', value: healthLabel },
+            ...activeProviderMetrics(activeProvider),
           ],
           warnings,
         },
@@ -44,6 +48,7 @@ export function createSearxngProvider({ baseUrl, timeZone, fetchImpl, timeoutSec
             + 'in local Claude Code transcripts whose result reports provider "searxng" (or, when the result is '
             + 'missing, that fall after a searxng entry in WEB_SEARCH_PROVIDER_HISTORY).',
           active,
+          activeProvider,
           attribution,
           ...history,
           health,

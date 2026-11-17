@@ -46,13 +46,49 @@ export function attributeWebSearchCall(call, { history = [], fallbackProvider = 
   return { provider: fallbackProvider, attributedBy: 'fallback' };
 }
 
+// Which backend is active now, for the badge and the Brave auto-probe policy.
+//   WEB_SEARCH_PROVIDER set   -> { id, source: 'configured' }
+//   unset, some call recorded -> the provider of the latest recorded call,
+//                                source 'transcripts' (a guess: never spend on it)
+//   unset, nothing recorded   -> { id: null, source: 'unknown' }
+// Cutover/fallback attribution is deliberately not used here: the fallback is
+// "brave", which would recreate the implicit-brave default this replaces.
+export function resolveActiveWebSearchProvider(configuredProvider, webSearchCalls = []) {
+  if (configuredProvider) return { id: configuredProvider, source: 'configured', at: null };
+  let latest = null;
+  let latestMs = -Infinity;
+  for (const call of webSearchCalls) {
+    if (!call.recordedProvider || !call.timestamp) continue;
+    const callMs = Date.parse(call.timestamp);
+    if (Number.isNaN(callMs) || callMs < latestMs) continue;
+    latest = call;
+    latestMs = callMs;
+  }
+  if (!latest) return { id: null, source: 'unknown', at: null };
+  return { id: latest.recordedProvider, source: 'transcripts', at: latest.timestamp };
+}
+
+export function describeActiveProvider(activeProvider) {
+  if (activeProvider.source === 'configured') return `${activeProvider.id} (WEB_SEARCH_PROVIDER)`;
+  if (activeProvider.source === 'transcripts') return `${activeProvider.id} (last recorded; WEB_SEARCH_PROVIDER unset)`;
+  return 'unknown (WEB_SEARCH_PROVIDER unset, none recorded)';
+}
+
+// Secondary metric shown on the search tiles only when the active backend is inferred.
+export function activeProviderMetrics(activeProvider) {
+  if (activeProvider.source === 'configured') return [];
+  return [{ label: 'Active web_search backend', value: describeActiveProvider(activeProvider) }];
+}
+
 // Returns the calls attributed to `providerId` plus counts of how they were attributed.
+// `providerId` may be a predicate, e.g. to collect providers this dashboard does not model.
 export function selectCallsForProvider(webSearchCalls, providerId, options) {
+  const matches = typeof providerId === 'function' ? providerId : (provider) => provider === providerId;
   const calls = [];
   const attribution = { recorded: 0, cutover: 0, fallback: 0 };
   for (const call of webSearchCalls) {
     const { provider, attributedBy } = attributeWebSearchCall(call, options);
-    if (provider !== providerId) continue;
+    if (!matches(provider)) continue;
     calls.push(call);
     attribution[attributedBy] += 1;
   }

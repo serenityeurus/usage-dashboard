@@ -2,6 +2,7 @@
 const appRoot = document.getElementById('app');
 const refreshButton = document.getElementById('refresh-button');
 const refreshedAtLabel = document.getElementById('refreshed-at');
+const todayLabel = document.getElementById('today-label');
 
 const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const integerFormatter = new Intl.NumberFormat('en-US');
@@ -30,6 +31,12 @@ async function fetchJson(url, options) {
   return body;
 }
 
+// The server recomputes windows on every read, so this follows local midnight
+// even when no refresh has run since.
+function setToday(range, timeZone) {
+  todayLabel.textContent = range?.today ? `Today: ${range.today}${timeZone ? ` (${timeZone})` : ''}` : '';
+}
+
 function setRefreshedAt(refreshedAt, durationMs) {
   refreshedAtLabel.textContent = refreshedAt
     ? `Updated ${formatDateTime(refreshedAt)}${durationMs != null ? ` (${durationMs} ms)` : ''}`
@@ -45,7 +52,7 @@ const MetricFormats = {
   messages: ['Messages', formatInteger],
 };
 const CostKindLabels = { actual: 'Actual', 'api-equivalent': 'API-equivalent', estimated: 'Estimated' };
-const ProviderColors = { claude: '#d97757', brave: '#fb542b', searxng: '#3fa7d6' };
+const ProviderColors = { claude: '#d97757', brave: '#fb542b', searxng: '#3fa7d6', 'other-search': '#9e9e9e' };
 const FallbackColors = ['#8bc34a', '#ab47bc', '#ffca28', '#26a69a', '#ec407a'];
 const providerColor = (providerId, index) => ProviderColors[providerId] || FallbackColors[index % FallbackColors.length];
 
@@ -70,7 +77,12 @@ function totalWindowRows() {
   ];
 }
 
-const activeBadge = (provider) => (provider.active ? '<span class="badge" title="Active web_search provider">active</span>' : '');
+function activeBadge(provider) {
+  if (!provider.active) return '';
+  const inferred = provider.activeProvider?.source === 'transcripts';
+  const title = inferred ? 'Most recently recorded web_search provider (WEB_SEARCH_PROVIDER is unset)' : 'Active web_search provider';
+  return `<span class="badge" title="${title}">${inferred ? 'active?' : 'active'}</span>`;
+}
 
 function renderTotalTile(total) {
   if (!total) return '';
@@ -90,12 +102,13 @@ function renderTotalTile(total) {
 // ---------- tiles ----------
 function renderTiles(summary) {
   setRefreshedAt(summary.refreshedAt, summary.durationMs);
+  setToday(summary.range, summary.timeZone);
   if (!summary.providers.length) {
     appRoot.innerHTML = '<p class="muted">Collecting data… this page will update shortly.</p>';
     setTimeout(route, 1500);
     return;
   }
-  appRoot.innerHTML = `${renderTotalTile(summary.total)}<section class="tile-grid">${summary.providers.map((provider) => `
+  appRoot.innerHTML = `${renderTotalTile(summary.total)}<section class="tile-grid">${summary.providers.filter((provider) => !provider.hidden).map((provider) => `
     <a class="tile${provider.active ? ' tile-active' : ''}" href="#/provider/${escapeHtml(provider.id)}" data-provider="${escapeHtml(provider.id)}">
       <h2>${escapeHtml(provider.name)} ${activeBadge(provider)}</h2>
       ${provider.ok === false ? `<p class="error">Error: ${escapeHtml(provider.error)}${provider.stale ? ' (showing last good data)' : ''}</p>` : ''}
@@ -367,6 +380,7 @@ function renderSearxngDetail(detail) {
 async function renderTotalDetail() {
   const payload = await fetchJson('/api/total');
   setRefreshedAt(payload.refreshedAt);
+  setToday(payload.range, payload.timeZone);
   if (!payload.summary) {
     appRoot.innerHTML = '<nav class="crumbs"><a href="#/">← All providers</a></nav><p class="muted">No data yet.</p>';
     return;
@@ -406,7 +420,22 @@ function scanFooter(scan) {
     ${formatInteger(scan.reparsedFileCount)} re-parsed this refresh, ${scan.durationMs} ms${scan.rootMissing ? ' — transcript directory not found!' : ''}${scan.unreadableFileCount ? `, ${scan.unreadableFileCount} unreadable` : ''}.</p>`;
 }
 
-const DetailRenderers = { claude: renderClaudeDetail, brave: renderBraveDetail, searxng: renderSearxngDetail };
+function renderOtherSearchDetail(detail) {
+  return `
+    <p class="note"><strong>${escapeHtml(detail.costLabel)}.</strong> ${escapeHtml(detail.costNote)}</p>
+    ${statCards([
+    { label: 'Searches (all time, from transcripts)', value: formatInteger(detail.totalCount) },
+    { label: `Searches ${detail.monthToDate.month}`, value: formatInteger(detail.monthToDate.count) },
+  ])}
+    <h3>By backend</h3>
+    ${dataTable([{ label: 'Backend', key: 'provider' }, { label: 'Searches', numeric: true, render: (row) => formatInteger(row.count) }], detail.byProvider)}
+    ${searchBreakdown(detail, { showSpend: false })}
+    ${scanFooter(detail.scan)}`;
+}
+
+const DetailRenderers = {
+  claude: renderClaudeDetail, brave: renderBraveDetail, searxng: renderSearxngDetail, 'other-search': renderOtherSearchDetail,
+};
 
 function renderGenericDetail(detail) {
   return `<pre class="raw">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>`;
@@ -415,6 +444,7 @@ function renderGenericDetail(detail) {
 async function renderDetail(providerId) {
   const payload = await fetchJson(`/api/providers/${encodeURIComponent(providerId)}`);
   setRefreshedAt(payload.refreshedAt);
+  setToday(payload.range, payload.timeZone);
   const renderer = DetailRenderers[providerId] || renderGenericDetail;
   appRoot.innerHTML = `
     <nav class="crumbs"><a href="#/">← All providers</a></nav>

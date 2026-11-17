@@ -14,6 +14,15 @@
 //     bare or on any of the configured ports (PORT and HOST_PORT).
 //   - An entry with a port ("dashboard.lan:443") matches exactly.
 //   - Matching is case-insensitive and ignores one trailing dot.
+//   - Malformed entries ("http://dash.lan", "dash.lan/", unbracketed "fe80::1")
+//     throw: a silently ignored entry looks configured but locks users out.
+//
+// Origin vs Host: a Host header without a port is accepted (browsers omit the
+// default port, and the Host check only defends against DNS rebinding). An
+// Origin is different: WHATWG URL drops default ports, so "http://localhost"
+// really means localhost:80, a different web origin than the dashboard. The
+// Origin check therefore compares the effective port (explicit, else 80/443).
+// Behind a TLS proxy on 443, list the host with its port ("dash.lan:443").
 
 export const DefaultAllowedHosts = ['localhost', '127.0.0.1', '[::1]'];
 
@@ -55,7 +64,9 @@ export function createHostPolicy({ allowedHosts = DefaultAllowedHosts, extraHost
   const exactHosts = new Set();
   for (const entry of [...allowedHosts, ...extraHosts]) {
     const parsed = parseHostHeader(String(entry));
-    if (!parsed) continue;
+    if (!parsed) {
+      throw new Error(`ALLOWED_HOSTS entry "${entry}" is not a host name: use host, host:port, [ipv6] or [ipv6]:port, without scheme or path`);
+    }
     if (parsed.port == null) anyPortHosts.add(parsed.hostname);
     else exactHosts.add(`${parsed.hostname}:${parsed.port}`);
   }
@@ -77,7 +88,12 @@ export function createHostPolicy({ allowedHosts = DefaultAllowedHosts, extraHost
       return false;
     }
     if (originUrl.protocol !== 'http:' && originUrl.protocol !== 'https:') return false;
-    return isAllowedHost(originUrl.host);
+    // URL.hostname keeps IPv6 brackets; reuse the Host parser to normalize case and a trailing dot.
+    const parsed = parseHostHeader(originUrl.hostname);
+    if (!parsed) return false;
+    const effectivePort = originUrl.port ? Number(originUrl.port) : (originUrl.protocol === 'https:' ? 443 : 80);
+    if (exactHosts.has(`${parsed.hostname}:${effectivePort}`)) return true;
+    return anyPortHosts.has(parsed.hostname) && portSet.has(effectivePort);
   }
 
   return {

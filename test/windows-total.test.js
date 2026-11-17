@@ -101,6 +101,55 @@ describe('dashboard state windows and probes', () => {
     assert.equal(snapshot.total.summary.windows.allTime.costByKind.actual, 1);
   });
 
+  it('recomputes windows and the total at read time, so they roll over at local midnight', async () => {
+    let clockNow = new Date('2026-11-17T04:30:00Z'); // 23:30 on 2026-11-16 in Detroit
+    const provider = {
+      id: 'p', name: 'P',
+      async collect() {
+        return { summary: { id: 'p', name: 'P', costKind: 'actual' }, detail: {}, timeSeries: { metrics: ['costUsd'], byDay: [{ day: '2026-11-16', costUsd: 1 }] } };
+      },
+    };
+    const state = createDashboardState({ providers: [provider], transcriptScanner: { scan: async () => ({}) }, clock: () => clockNow, timeZone: 'America/Detroit' });
+    await state.refresh('startup');
+    assert.equal(state.getSnapshot().providers.p.summary.windows.today.costUsd, 1);
+    assert.equal(state.getSnapshot().range.today, '2026-11-16');
+
+    clockNow = new Date('2026-11-17T05:30:00Z'); // 00:30 on 2026-11-17 in Detroit, no refresh since
+    const snapshot = state.getSnapshot();
+    assert.equal(snapshot.range.today, '2026-11-17');
+    assert.equal(snapshot.providers.p.summary.windows.range.today, '2026-11-17');
+    assert.equal(snapshot.providers.p.summary.windows.today.costUsd, 0);
+    assert.equal(snapshot.providers.p.summary.windows.last7Days.costUsd, 1);
+    assert.equal(snapshot.total.summary.windows.today.costUsd, 0);
+    assert.equal(snapshot.total.summary.range.today, '2026-11-17');
+    assert.equal(snapshot.refreshedAt, '2026-11-17T04:30:00.000Z', 'reading must not pretend a refresh happened');
+  });
+
+  it('recomputes a failed provider\'s reused windows against the current day', async () => {
+    let clockNow = new Date('2026-11-17T04:30:00Z');
+    let shouldFail = false;
+    const flaky = {
+      id: 'flaky', name: 'Flaky',
+      async collect() {
+        if (shouldFail) throw new Error('upstream down');
+        return { summary: { id: 'flaky', name: 'Flaky', costKind: 'estimated' }, detail: { ok: 1 }, timeSeries: { metrics: ['costUsd', 'searches'], byDay: [{ day: '2026-11-16', costUsd: 2, searches: 4 }] } };
+      },
+    };
+    const state = createDashboardState({ providers: [flaky], transcriptScanner: { scan: async () => ({}) }, clock: () => clockNow, timeZone: 'America/Detroit' });
+    await state.refresh('startup');
+    clockNow = new Date('2026-11-17T05:30:00Z');
+    shouldFail = true;
+    const snapshot = await state.refresh('refresh');
+    const entry = snapshot.providers.flaky;
+    assert.equal(entry.ok, false);
+    assert.equal(entry.stale, true);
+    assert.deepEqual(entry.detail, { ok: 1 });
+    assert.equal(entry.summary.windows.range.today, '2026-11-17');
+    assert.deepEqual(entry.summary.windows.today, { costUsd: 0, searches: 0 });
+    assert.deepEqual(snapshot.total.summary.windows.today.costByKind.estimated, 0);
+    assert.equal(snapshot.total.summary.windows.last7Days.searches, 4);
+  });
+
   it('never drops an explicit probe request that arrives during a plain refresh', async () => {
     const seenProbes = [];
     let release;
@@ -124,10 +173,10 @@ describe('dashboard state windows and probes', () => {
 });
 
 describe('loadConfig', () => {
-  it('defaults the time zone to America/Detroit and the provider to brave', () => {
+  it('defaults the time zone to America/Detroit and leaves the provider unset', () => {
     const config = loadConfig({});
     assert.equal(config.timeZone, 'America/Detroit');
-    assert.equal(config.webSearchProvider, 'brave');
+    assert.equal(config.webSearchProvider, null, 'unset means "infer from transcripts", never an implicit brave');
     assert.equal(config.braveQuotaProbe, 'auto');
     assert.deepEqual(config.allowedHosts, []);
   });
@@ -151,5 +200,22 @@ describe('loadConfig', () => {
     assert.throws(() => loadConfig({ BRAVE_QUOTA_PROBE: 'yes' }), /BRAVE_QUOTA_PROBE/);
     assert.throws(() => loadConfig({ SEARXNG_BASE_URL: 'ftp://x' }), /SEARXNG_BASE_URL/);
     assert.throws(() => loadConfig({ TZ: 'Mars/Olympus' }), /time zone/);
+  });
+
+  it('accepts the POSIX leading colon in TZ', () => {
+    assert.equal(loadConfig({ TZ: ':America/Detroit' }).timeZone, 'America/Detroit');
+    assert.equal(loadConfig({ DASHBOARD_TIME_ZONE: ':UTC' }).timeZone, 'UTC');
+    assert.throws(() => loadConfig({ TZ: ':' }), /time zone/);
+  });
+
+  it('rejects malformed ALLOWED_HOSTS entries with a clear error', () => {
+    for (const entry of ['http://dash.lan', 'dash.lan/', 'fe80::1', 'dash.lan:0']) {
+      assert.throws(() => loadConfig({ ALLOWED_HOSTS: `localhost, ${entry}` }), (error) => {
+        assert.match(error.message, /ALLOWED_HOSTS/);
+        assert.ok(error.message.includes(`"${entry}"`), error.message);
+        return true;
+      });
+    }
+    assert.deepEqual(loadConfig({ ALLOWED_HOSTS: '[fe80::1], dash.lan:443' }).allowedHosts, ['[fe80::1]', 'dash.lan:443']);
   });
 });

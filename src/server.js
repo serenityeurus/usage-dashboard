@@ -9,6 +9,7 @@ import { createDashboardState } from './dashboard-state.js';
 import { checkRequest, createHostPolicy } from './http-guard.js';
 import { createBraveProvider } from './providers/brave/index.js';
 import { createClaudeProvider } from './providers/claude/index.js';
+import { createOtherWebSearchProvider } from './providers/other-search/index.js';
 import { createSearxngProvider } from './providers/searxng/index.js';
 import { TranscriptScanner } from './transcript-scanner.js';
 
@@ -30,6 +31,7 @@ Endpoints:
   GET  /api/summary             cached tile summaries for all providers
   GET  /api/providers/:id       cached detail payload for one provider
   GET  /api/total               cached "All platforms" roll-up and per-day breakdown
+                                (GET routes also answer HEAD; other methods get 405)
   POST /api/refresh             re-read all sources, then return the summary
                                 (?probe=brave also runs the paid Brave quota probe)
 
@@ -61,6 +63,7 @@ function summaryView(snapshot) {
     refreshReason: snapshot.refreshReason,
     durationMs: snapshot.durationMs,
     timeZone: snapshot.timeZone,
+    range: snapshot.range,
     total: snapshot.total?.summary ?? null,
     providers: Object.values(snapshot.providers).map((entry) => ({
       ...entry.summary, ok: entry.ok, error: entry.error, stale: entry.stale,
@@ -114,44 +117,54 @@ export function createRequestHandler({ dashboardState, publicDir, hostPolicy = c
       sendJson(response, 400, { error: 'malformed request URL' });
       return;
     }
+    // HEAD is answered wherever GET is (RFC 9110 9.3.2; Node drops the body),
+    // matching the static files. Every other method on a known route gets 405
+    // with an Allow header; OPTIONS included, since there is no CORS to
+    // negotiate and answering preflights would only advertise cross-origin use.
+    const isRead = request.method === 'GET' || request.method === 'HEAD';
+    const methodNotAllowed = (allow) => {
+      response.setHeader('Allow', allow);
+      sendJson(response, 405, { error: `method not allowed, use ${allow}` });
+    };
     try {
-      if (url.pathname === '/healthz' && request.method === 'GET') {
-        const snapshot = dashboardState.getSnapshot();
+      if (url.pathname === '/healthz') {
+        if (!isRead) return methodNotAllowed('GET, HEAD');
         sendJson(response, 200, {
-          status: 'ok', startedAt: startedAt.toISOString(), refreshedAt: snapshot.refreshedAt, refreshing: dashboardState.isRefreshing(),
+          status: 'ok', startedAt: startedAt.toISOString(), refreshedAt: dashboardState.getRefreshedAt(), refreshing: dashboardState.isRefreshing(),
         });
         return;
       }
-      if (url.pathname === '/api/summary' && request.method === 'GET') {
+      if (url.pathname === '/api/summary') {
+        if (!isRead) return methodNotAllowed('GET, HEAD');
         sendJson(response, 200, summaryView(dashboardState.getSnapshot()));
         return;
       }
       if (url.pathname === '/api/refresh') {
-        if (request.method !== 'POST') {
-          sendJson(response, 405, { error: 'use POST' });
-          return;
-        }
+        if (request.method !== 'POST') return methodNotAllowed('POST');
         const probes = url.searchParams.getAll('probe').flatMap((value) => value.split(',')).filter(Boolean);
         const snapshot = await dashboardState.refresh('refresh', { probes });
         sendJson(response, 200, summaryView(snapshot));
         return;
       }
-      if (url.pathname === '/api/total' && request.method === 'GET') {
+      if (url.pathname === '/api/total') {
+        if (!isRead) return methodNotAllowed('GET, HEAD');
         const snapshot = dashboardState.getSnapshot();
         sendJson(response, 200, {
-          refreshedAt: snapshot.refreshedAt, timeZone: snapshot.timeZone, summary: snapshot.total?.summary ?? null, detail: snapshot.total?.detail ?? null,
+          refreshedAt: snapshot.refreshedAt, timeZone: snapshot.timeZone, range: snapshot.range, summary: snapshot.total?.summary ?? null, detail: snapshot.total?.detail ?? null,
         });
         return;
       }
       const providerMatch = url.pathname.match(/^\/api\/providers\/([a-z0-9-]+)$/);
-      if (providerMatch && request.method === 'GET') {
-        const entry = dashboardState.getSnapshot().providers[providerMatch[1]];
+      if (providerMatch) {
+        if (!isRead) return methodNotAllowed('GET, HEAD');
+        const snapshot = dashboardState.getSnapshot();
+        const entry = snapshot.providers[providerMatch[1]];
         if (!entry) {
           sendJson(response, 404, { error: `unknown provider "${providerMatch[1]}"`, known: dashboardState.providerIds() });
           return;
         }
         sendJson(response, 200, {
-          refreshedAt: dashboardState.getSnapshot().refreshedAt, ok: entry.ok, error: entry.error, summary: entry.summary, detail: entry.detail,
+          refreshedAt: snapshot.refreshedAt, timeZone: snapshot.timeZone, range: snapshot.range, ok: entry.ok, error: entry.error, summary: entry.summary, detail: entry.detail,
         });
         return;
       }
@@ -159,10 +172,7 @@ export function createRequestHandler({ dashboardState, publicDir, hostPolicy = c
         sendJson(response, 404, { error: 'not found' });
         return;
       }
-      if (request.method !== 'GET' && request.method !== 'HEAD') {
-        response.writeHead(405).end();
-        return;
-      }
+      if (!isRead) return methodNotAllowed('GET, HEAD');
       await serveStatic(publicDir, url.pathname, response);
     } catch (error) {
       if (error instanceof BadRequestError) {
@@ -195,16 +205,17 @@ async function main() {
       quotaMinIntervalSeconds: config.braveQuotaMinIntervalSeconds,
       probeOnStartup: config.probeBraveOnStartup,
       quotaProbeMode: config.braveQuotaProbe,
-      active: config.webSearchProvider === 'brave',
+      webSearchProvider: config.webSearchProvider,
       attributionOptions,
     }),
     createSearxngProvider({
       baseUrl: config.searxngBaseUrl,
       timeZone: config.timeZone,
       timeoutSeconds: config.searxngTimeoutSeconds,
-      active: config.webSearchProvider === 'searxng',
+      webSearchProvider: config.webSearchProvider,
       attributionOptions,
     }),
+    createOtherWebSearchProvider({ timeZone: config.timeZone, attributionOptions }),
   ];
   const dashboardState = createDashboardState({ providers, transcriptScanner, timeZone: config.timeZone });
   const hostPolicy = createHostPolicy({ extraHosts: config.allowedHosts, ports: [config.port, config.hostPort] });
@@ -212,7 +223,7 @@ async function main() {
 
   server.listen(config.port, config.listenHost, () => {
     console.log(`usage-dashboard listening on http://${config.listenHost}:${config.port} (tz ${config.timeZone}, `
-      + `web_search provider ${config.webSearchProvider}, allowed hosts ${JSON.stringify(hostPolicy.describe())})`);
+      + `web_search provider ${config.webSearchProvider ?? 'unset (inferred from transcripts, no auto Brave probe)'}, allowed hosts ${JSON.stringify(hostPolicy.describe())})`);
   });
   const snapshot = await dashboardState.refresh('startup');
   const scanStats = snapshot.providers.claude?.detail?.scan;

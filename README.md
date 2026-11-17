@@ -24,11 +24,11 @@ To run the tests: `npm test`.
 | --- | --- | --- |
 | `BIND_ADDRESS` | `127.0.0.1` | Host interface the port is published on. Use `0.0.0.0` for LAN access (there is no auth). |
 | `HOST_PORT` | `8787` | Host port. |
-| `ALLOWED_HOSTS` | empty | Extra `Host` names allowed to reach the server (see [Security](#security)). |
+| `ALLOWED_HOSTS` | empty | Extra `Host` names allowed to reach the server (see [Security](#security)). Entries are `host`, `host:port`, `[ipv6]` or `[ipv6]:port`; anything else (a scheme, a path, an unbracketed IPv6 address) stops startup with an error. |
 | `CLAUDE_PROJECTS_DIR` | `$HOME/.claude/projects` | Claude Code transcript root. Mounted read-only. |
-| `DASHBOARD_TIME_ZONE` | `TZ`, else `America/Detroit` | IANA time zone for daily/monthly buckets and the today/7-day windows. |
+| `DASHBOARD_TIME_ZONE` | `TZ`, else `America/Detroit` | IANA time zone for daily/monthly buckets and the today/7-day windows. The POSIX leading colon (`TZ=:America/Detroit`) is accepted. |
 | `ANTHROPIC_ADMIN_KEY` | empty | Optional Admin API key for real org usage and cost. |
-| `WEB_SEARCH_PROVIDER` | `brave` | Which backend OpenClaw's `web_search` uses now (`brave` or `searxng`). Marks that tile **active** and controls the Brave probe. |
+| `WEB_SEARCH_PROVIDER` | unset | Which backend OpenClaw's `web_search` uses now (`brave` or `searxng`). Marks that tile **active** and controls the Brave probe. When unset, see [Active provider](#active-provider). |
 | `WEB_SEARCH_PROVIDER_HISTORY` | empty | Cutover history for calls whose result records no provider, e.g. `searxng@2026-11-17T21:00:00Z`. |
 | `SEARXNG_BASE_URL` | compose: `http://host.docker.internal:8888` | SearXNG instance for the health check. Outside Docker use `http://127.0.0.1:8888`. |
 | `SEARXNG_TIMEOUT_SECONDS` | `5` | Health-check timeout. |
@@ -37,7 +37,7 @@ To run the tests: `npm test`.
 | `BRAVE_MONTHLY_CREDIT_USD` | `5` | Brave's free monthly credit. |
 | `BRAVE_QUOTA_MIN_INTERVAL_SECONDS` | `60` | Minimum gap between quota probes. |
 | `BRAVE_PROBE_ON_STARTUP` | `true` | Set to `false` to skip the probe at container start. |
-| `BRAVE_QUOTA_PROBE` | `auto` | `auto`: probe while Brave is active, otherwise only on an explicit **Probe quota** click. `true`: every refresh. `false`: never. |
+| `BRAVE_QUOTA_PROBE` | `auto` | `auto`: probe while `WEB_SEARCH_PROVIDER=brave`; otherwise (another provider, or unset) only on an explicit **Probe quota** click. `true`: every refresh. `false`: never. |
 
 Model prices live in `config/pricing.json`, in USD per million tokens. The file is mounted into the container and re-read on every refresh, so you can edit it without rebuilding.
 
@@ -50,6 +50,8 @@ Each provider returns a normalized per-day series (`timeSeries` in the adapter c
 - `today`: the current calendar day in the dashboard time zone.
 - `last7Days`: today plus the six previous calendar days.
 - `allTime`: everything, including calls with no timestamp.
+
+Windows and the total are recomputed from the stored per-day series on every read (`/api/summary`, `/api/total`, `/api/providers/:id`), not when the data is refreshed. "Today" therefore rolls over at local midnight without a Refresh, and a provider whose last refresh failed (its previous data is shown, marked stale) is windowed against the current day too. The page header shows the day currently used as "today". Claude's windows sum unrounded per-day cost and round once, so `allTime` matches the Claude tile's all-time cost.
 
 The **All platforms** tile (`total` in `/api/summary`, full payload at `/api/total`) adds the windows of every provider. Spend is labelled by kind, because the numbers are not the same sort of money:
 
@@ -88,9 +90,14 @@ OpenClaw's `web_search` tool can use several backends, selected by the OpenClaw 
 1. **Recorded provider (primary).** OpenClaw's tool result is a JSON payload with a top-level `"provider"` field (`"brave"`, `"searxng"`). The transcript scanner matches each `tool_use` with its later `tool_result` (`tool_use_id`) and keeps that field. This was verified on real transcripts: every Brave result before the switch carries `"provider": "brave"`, and the SearXNG plugin writes `"provider": "searxng"`.
 2. **Cutover history (fallback).** Calls with no parseable result (errors, interrupted sessions) are attributed by time using `WEB_SEARCH_PROVIDER_HISTORY`, e.g. `searxng@2026-11-17T21:00:00Z`. Calls before the first entry, or with no history, count as Brave, because every search before v0.2 was Brave.
 
-Brave's history and spend therefore no longer include searches that SearXNG served. Each detail view shows how many calls were attributed by each method. Calls recorded for another backend (for example DuckDuckGo) are counted by neither tile.
+Brave's history and spend therefore no longer include searches that SearXNG served. Each detail view shows how many calls were attributed by each method. Calls recorded for a backend this dashboard does not model (for example `"perplexity"`) are counted under **Other web search** (`other-search`). They add to the total's search counts but never to spend, because their price is unknown. That tile stays hidden until such a call exists.
 
 `WEB_SEARCH_PROVIDER` only labels the active backend and drives the Brave probe policy; it never changes attribution. The dashboard does not read `openclaw.json` (it holds secrets), so keep this env value in sync with the OpenClaw setting by hand.
+
+#### Active provider
+
+- **`WEB_SEARCH_PROVIDER` set:** that tile gets the **active** badge. With `BRAVE_QUOTA_PROBE=auto`, Brave is probed on startup and Refresh only when it is `brave`.
+- **Unset:** the badge goes to the backend of the most recent `web_search` call whose result recorded a provider, shown as **active?** with a tooltip. The search tiles also show an "Active web_search backend" line, e.g. `searxng (last recorded; WEB_SEARCH_PROVIDER unset)`. With no recorded call it reads `unknown`. Because this is inferred, `BRAVE_QUOTA_PROBE=auto` never probes; only an explicit **Probe quota now** click does (`BRAVE_QUOTA_PROBE=true` still probes every refresh). Earlier versions defaulted the unset value to `brave`, which spent a paid query per refresh while OpenClaw was actually on SearXNG.
 
 ### SearXNG
 
@@ -131,7 +138,7 @@ Searches already made stay attributed by their recorded provider, so switching n
 There is no authentication, so the server guards against browser-based attacks on a loopback service:
 
 - **Host allowlist (DNS rebinding).** Every request must carry a `Host` header naming `localhost`, `127.0.0.1` or `[::1]` (bare or on `PORT`/`HOST_PORT`), or an `ALLOWED_HOSTS` entry. Entries without a port are allowed on those ports; entries with a port match exactly. Anything else gets `403`.
-- **Origin check (CSRF).** A non-GET request (that is, `POST /api/refresh`, which can spend a Brave query) with an `Origin` header that is not an allowed host, or is `null`, gets `403`. Requests without `Origin` (curl, scripts) are allowed.
+- **Origin check (CSRF).** A non-GET request (that is, `POST /api/refresh`, which can spend a Brave query) with an `Origin` header that is not an allowed host, or is `null`, gets `403`. Requests without `Origin` (curl, scripts) are allowed. The Origin's effective port counts: `http://localhost` means port 80 and `https://localhost` port 443, so a page served by another local web server cannot POST to the dashboard on 8787. Behind a TLS reverse proxy on 443, list the host with its port (`ALLOWED_HOSTS=dash.lan:443`); a port-less entry only covers `PORT`/`HOST_PORT` for Origins. (A port-less `Host` header is still accepted for port-less entries.)
 - **Malformed paths.** Bad percent-encoding (for example `/%E0%A4%A`) returns `400`; path traversal returns `403`.
 
 If you expose the dashboard on the LAN (`BIND_ADDRESS=0.0.0.0`), add the name or IP you browse to to `ALLOWED_HOSTS`.
@@ -140,13 +147,15 @@ If you expose the dashboard on the LAN (`BIND_ADDRESS=0.0.0.0`), add the name or
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/healthz` | Liveness check. |
-| GET | `/api/summary` | Cached tile summaries. Reads no sources. |
-| GET | `/api/providers/:id` | Cached detail payload. |
-| GET | `/api/total` | Cached All platforms roll-up: windows, spend and searches per provider per day, per-provider rows. |
+| GET, HEAD | `/healthz` | Liveness check. |
+| GET, HEAD | `/api/summary` | Cached tile summaries. Reads no sources. |
+| GET, HEAD | `/api/providers/:id` | Cached detail payload. |
+| GET, HEAD | `/api/total` | Cached All platforms roll-up: windows, spend and searches per provider per day, per-provider rows. |
 | POST | `/api/refresh` | Re-reads all sources, then returns the summary. Concurrent calls share one run. `?probe=brave` also runs the paid Brave quota probe. |
 
-`/api/summary` returns `{ refreshedAt, timeZone, total, providers[] }`. Each provider summary includes `costKind`, `active` (web search backends) and `windows: { range, metrics, today, last7Days, allTime }`.
+HEAD is answered wherever GET is (same status and headers, no body), as for the static files. Any other method on a known route, including `OPTIONS`, gets `405` with an `Allow` header; there is no CORS, so there is nothing for a preflight to negotiate. Unknown `/api/` paths get `404`.
+
+`/api/summary` returns `{ refreshedAt, timeZone, range: { today, weekStart }, total, providers[] }`. Each provider summary includes `costKind`, `active` (web search backends) and `windows: { range, metrics, today, last7Days, allTime }`.
 
 ## Adding a provider
 
@@ -163,6 +172,6 @@ If you expose the dashboard on the LAN (`BIND_ADDRESS=0.0.0.0`), add the name or
 - Admin API support was tested against mocked responses only; it has not been exercised with a live key.
 - Brave estimates count every Brave-attributed call, including any that OpenClaw answered from its in-process result cache. No Brave results seen so far were marked as cached.
 - Attribution by cutover time is only as accurate as `WEB_SEARCH_PROVIDER_HISTORY`. It applies only to calls whose result records no provider.
-- The active-provider badge comes from `WEB_SEARCH_PROVIDER`, not from OpenClaw's live config, so it can drift if one is changed without the other.
-- The 7-day and today windows are fixed when the snapshot is taken. A page left open past midnight shows yesterday's "today" until the next Refresh.
+- The active-provider badge comes from `WEB_SEARCH_PROVIDER`, not from OpenClaw's live config, so it can drift if one is changed without the other. When unset, it is only as current as the last recorded search.
+- Windows roll over at midnight on the next API read, but an open page does not poll: reload or navigate to see the new day. Month-to-date figures (e.g. "Searches 2026-11") are still fixed at refresh time.
 - There is no authentication. Keep `BIND_ADDRESS=127.0.0.1` or put the dashboard behind a reverse proxy that handles auth.

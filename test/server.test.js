@@ -59,7 +59,7 @@ describe('dashboard state and HTTP API', () => {
       const request = http.request({ host: '127.0.0.1', port, method, path: requestPath, headers, setHost: !('host' in headers) }, (response) => {
         let body = '';
         response.on('data', (chunk) => { body += chunk; });
-        response.on('end', () => resolve({ status: response.statusCode, body }));
+        response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
       });
       request.on('error', reject);
       request.end();
@@ -90,6 +90,52 @@ describe('dashboard state and HTTP API', () => {
     assert.equal(noOrigin.status, 200);
     // GETs are not state-changing: a cross-origin Origin header alone does not block them.
     assert.equal((await rawRequest({ path: '/healthz', headers: { origin: 'https://evil.example' } })).status, 200);
+  });
+
+  it('rejects Origins on a default port (80/443) that is not the dashboard port', async () => {
+    const before = collectCount;
+    for (const origin of ['http://localhost', 'https://localhost', 'http://127.0.0.1:80']) {
+      for (const requestPath of ['/api/refresh?probe=brave', '/api/nonexistent']) {
+        const response = await rawRequest({ method: 'POST', path: requestPath, headers: { origin } });
+        assert.equal(response.status, 403, `${origin} ${requestPath}`);
+        assert.match(response.body, /cross-origin/);
+      }
+    }
+    assert.equal(collectCount, before);
+    // Passes the guard and reaches routing (404), rather than 403.
+    const allowed = await rawRequest({ method: 'POST', path: '/api/nonexistent', headers: { origin: `http://localhost:${port}` } });
+    assert.equal(allowed.status, 404);
+  });
+
+  it('answers HEAD like GET and 405 (with Allow) for other methods on API routes', async () => {
+    for (const requestPath of ['/healthz', '/api/summary', '/api/total', '/api/providers/good']) {
+      const head = await rawRequest({ method: 'HEAD', path: requestPath });
+      assert.equal(head.status, 200, `HEAD ${requestPath}`);
+      assert.equal(head.body, '');
+      assert.equal(head.headers['content-type'], 'application/json; charset=utf-8');
+      for (const method of ['OPTIONS', 'PUT', 'DELETE']) {
+        const response = await rawRequest({ method, path: requestPath });
+        assert.equal(response.status, 405, `${method} ${requestPath}`);
+        assert.equal(response.headers.allow, 'GET, HEAD');
+      }
+    }
+    const refreshHead = await rawRequest({ method: 'HEAD', path: '/api/refresh' });
+    assert.equal(refreshHead.status, 405);
+    assert.equal(refreshHead.headers.allow, 'POST');
+    assert.equal((await rawRequest({ method: 'OPTIONS', path: '/api/nonexistent' })).status, 404);
+    assert.equal((await rawRequest({ method: 'HEAD', path: '/api/providers/nope' })).status, 404);
+    const staticOptions = await rawRequest({ method: 'OPTIONS', path: '/' });
+    assert.equal(staticOptions.status, 405);
+    assert.equal(staticOptions.headers.allow, 'GET, HEAD');
+  });
+
+  it('exposes the current day range in the summary, total and provider payloads', async () => {
+    const summary = await (await fetch(`${baseUrl}/api/summary`)).json();
+    assert.match(summary.range.today, /^\d{4}-\d{2}-\d{2}$/);
+    const total = await (await fetch(`${baseUrl}/api/total`)).json();
+    assert.equal(total.range.today, summary.range.today);
+    const detail = await (await fetch(`${baseUrl}/api/providers/good`)).json();
+    assert.equal(detail.range.today, summary.range.today);
   });
 
   it('returns 400, not 500, for malformed percent-encoding in the path', async () => {

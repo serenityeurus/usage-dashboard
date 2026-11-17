@@ -1,17 +1,22 @@
 // Brave Search provider adapter: live quota headers + transcript-derived history.
-import { selectCallsForProvider } from '../../web-search-attribution.js';
+import { activeProviderMetrics, resolveActiveWebSearchProvider, selectCallsForProvider } from '../../web-search-attribution.js';
 import { aggregateWebSearchCalls, searchTimeSeries } from '../../web-search-history.js';
 import { createQuotaProbe } from './quota.js';
 
 // Each quota probe is a billable Brave query, so decide carefully:
 //   BRAVE_QUOTA_PROBE=false -> never probe
 //   BRAVE_QUOTA_PROBE=true  -> probe on every refresh (startup per BRAVE_PROBE_ON_STARTUP)
-//   BRAVE_QUOTA_PROBE=auto  -> like true while Brave is the active web_search
-//                              provider; otherwise only when explicitly requested
-//                              (POST /api/refresh?probe=brave, the "Probe quota" button)
-export function decideQuotaProbe({ mode, active, probeOnStartup, reason, explicitlyRequested }) {
+//   BRAVE_QUOTA_PROBE=auto  -> like true while WEB_SEARCH_PROVIDER=brave; otherwise
+//                              (another provider, or the variable unset so the
+//                              active one is only inferred) only when explicitly
+//                              requested (POST /api/refresh?probe=brave, the
+//                              "Probe quota" button)
+export function decideQuotaProbe({ mode, active, activeSource = 'configured', probeOnStartup, reason, explicitlyRequested }) {
   if (mode === 'false') return { probe: false, why: 'disabled by BRAVE_QUOTA_PROBE=false' };
   if (explicitlyRequested) return { probe: true, why: 'explicitly requested' };
+  if (mode === 'auto' && activeSource !== 'configured') {
+    return { probe: false, why: 'WEB_SEARCH_PROVIDER is unset, so the active provider is unconfirmed; probe on request only' };
+  }
   if (mode === 'auto' && !active) return { probe: false, why: 'Brave is not the active web_search provider; probe on request only' };
   if (reason === 'startup' && !probeOnStartup) return { probe: false, why: 'skipped at startup (BRAVE_PROBE_ON_STARTUP=false)' };
   return { probe: true, why: reason };
@@ -19,7 +24,7 @@ export function decideQuotaProbe({ mode, active, probeOnStartup, reason, explici
 
 export function createBraveProvider({
   apiKey, costPer1k, monthlyCreditUsd, timeZone, fetchImpl, quotaMinIntervalSeconds, probeOnStartup = true,
-  quotaProbeMode = 'auto', active = true, attributionOptions = {},
+  quotaProbeMode = 'auto', webSearchProvider = null, attributionOptions = {},
 }) {
   const quotaProbe = createQuotaProbe({ apiKey, fetchImpl, minIntervalSeconds: quotaMinIntervalSeconds });
 
@@ -30,12 +35,15 @@ export function createBraveProvider({
       const transcripts = await context.getTranscripts();
       // Only calls attributed to Brave: SearXNG-served searches must not be billed here.
       const { calls, attribution } = selectCallsForProvider(transcripts.webSearchCalls, 'brave', attributionOptions);
+      const activeProvider = resolveActiveWebSearchProvider(webSearchProvider, transcripts.webSearchCalls);
+      const active = activeProvider.id === 'brave';
       const history = aggregateWebSearchCalls(calls, {
         timeZone, costPer1k, monthlyCreditUsd, now: context.now,
       });
       const probeDecision = decideQuotaProbe({
         mode: quotaProbeMode,
         active,
+        activeSource: activeProvider.source,
         probeOnStartup,
         reason: context.reason,
         explicitlyRequested: Boolean(context.probes?.has('brave')),
@@ -52,6 +60,7 @@ export function createBraveProvider({
       } else if (monthly?.unlimited) {
         secondaryMetrics.push({ label: 'Monthly quota (Brave)', value: 'unlimited (pay as you go)' });
       }
+      secondaryMetrics.push(...activeProviderMetrics(activeProvider));
 
       const warnings = [];
       if (!quotaResult.configured) warnings.push('BRAVE_API_KEY not set: live quota unavailable');
@@ -62,6 +71,7 @@ export function createBraveProvider({
           id: 'brave',
           name: 'Brave Search',
           active,
+          activeProvider,
           costKind: 'estimated',
           costLabel: 'Estimated spend (all-time, before credit)',
           costUsd: history.totalGrossUsd,
@@ -78,6 +88,7 @@ export function createBraveProvider({
             + 'searches made outside those transcripts are not counted. The quota probe itself uses one query.',
           pricing: { costPer1k, monthlyCreditUsd },
           active,
+          activeProvider,
           attribution,
           ...history,
           quota: quotaResult,

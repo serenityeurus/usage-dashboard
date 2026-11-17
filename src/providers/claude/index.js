@@ -13,7 +13,7 @@ export function createClaudeProvider({ pricingFilePath, adminKey, timeZone, fetc
     async collect(context) {
       const pricingTable = await loadPricingTable(pricingFilePath); // re-read so edits apply on refresh
       const transcripts = await context.getTranscripts();
-      const aggregate = aggregateClaudeUsage(transcripts.usageRecords, { pricingTable, timeZone, now: context.now });
+      const { byDayUnroundedCostUsd, ...aggregate } = aggregateClaudeUsage(transcripts.usageRecords, { pricingTable, timeZone, now: context.now });
 
       if (!adminKey) cachedAdminUsage = { configured: false };
       else if (context.reason !== 'page-load') {
@@ -47,7 +47,7 @@ export function createClaudeProvider({ pricingFilePath, adminKey, timeZone, fetc
         timeSeries: {
           metrics: ['costUsd', 'tokens', 'messages'],
           byDay: aggregate.byDay.map((row) => ({
-            day: row.day, costUsd: row.costUsd, tokens: row.totalTokens, messages: row.messageCount,
+            day: row.day, costUsd: byDayUnroundedCostUsd[row.day], tokens: row.totalTokens, messages: row.messageCount,
           })),
         },
         detail: {
