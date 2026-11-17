@@ -36,6 +36,57 @@ function setRefreshedAt(refreshedAt, durationMs) {
     : 'Collecting data…';
 }
 
+// ---------- time windows (normalized by the server for every provider) ----------
+const WindowColumns = [['today', 'Today'], ['last7Days', '7 days'], ['allTime', 'All time']];
+const MetricFormats = {
+  costUsd: ['Spend', formatUsd],
+  tokens: ['Tokens', formatCompact],
+  searches: ['Searches', formatInteger],
+  messages: ['Messages', formatInteger],
+};
+const CostKindLabels = { actual: 'Actual', 'api-equivalent': 'API-equivalent', estimated: 'Estimated' };
+const ProviderColors = { claude: '#d97757', brave: '#fb542b', searxng: '#3fa7d6' };
+const FallbackColors = ['#8bc34a', '#ab47bc', '#ffca28', '#26a69a', '#ec407a'];
+const providerColor = (providerId, index) => ProviderColors[providerId] || FallbackColors[index % FallbackColors.length];
+
+function windowsTable(windows, { costKind, rows } = {}) {
+  if (!windows) return '';
+  const metricRows = rows || (windows.metrics || []).map((metric) => {
+    const [label, format] = MetricFormats[metric] || [metric, formatInteger];
+    const fullLabel = metric === 'costUsd' && costKind ? `${label} (${CostKindLabels[costKind] || costKind})` : label;
+    return { label: fullLabel, value: (window) => format(window?.[metric]) };
+  });
+  return `<table class="windows"><thead><tr><th></th>${WindowColumns.map(([, label]) => `<th class="num">${label}</th>`).join('')}</tr></thead>
+    <tbody>${metricRows.map((row) => `<tr class="${row.className || ''}"><th scope="row">${escapeHtml(row.label)}</th>${WindowColumns.map(([windowId]) => `<td class="num">${row.value(windows[windowId])}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+}
+
+function totalWindowRows() {
+  return [
+    { label: 'Total spend', value: (window) => formatUsd(window?.costUsd), className: 'strong' },
+    ...Object.entries(CostKindLabels).map(([kind, label]) => ({ label: `  ${label}`, value: (window) => formatUsd(window?.costByKind?.[kind]), className: 'sub' })),
+    { label: 'Tokens', value: (window) => formatCompact(window?.tokens) },
+    { label: 'Searches (all providers)', value: (window) => formatInteger(window?.searches) },
+    { label: 'Messages', value: (window) => formatInteger(window?.messages) },
+  ];
+}
+
+const activeBadge = (provider) => (provider.active ? '<span class="badge" title="Active web_search provider">active</span>' : '');
+
+function renderTotalTile(total) {
+  if (!total) return '';
+  return `<a class="tile tile-total" href="#/total" data-provider="total">
+      <h2>${escapeHtml(total.name)} <span class="muted small">${formatInteger(total.providerCount)} providers</span></h2>
+      <div class="tile-primary">
+        <div><span class="big">${formatUsd(total.windows.allTime.costUsd)}</span><span class="label">Total spend, all time (actual + API-equivalent + estimated)</span></div>
+        <div><span class="big">${formatCompact(total.windows.allTime.tokens)}</span><span class="label">Tokens</span></div>
+        <div><span class="big">${formatInteger(total.windows.allTime.searches)}</span><span class="label">Searches</span></div>
+        <div><span class="big">${formatInteger(total.windows.allTime.messages)}</span><span class="label">Messages</span></div>
+      </div>
+      ${windowsTable(total.windows, { rows: totalWindowRows() })}
+      <span class="tile-cta">View combined breakdown →</span>
+    </a>`;
+}
+
 // ---------- tiles ----------
 function renderTiles(summary) {
   setRefreshedAt(summary.refreshedAt, summary.durationMs);
@@ -44,14 +95,15 @@ function renderTiles(summary) {
     setTimeout(route, 1500);
     return;
   }
-  appRoot.innerHTML = `<section class="tile-grid">${summary.providers.map((provider) => `
-    <a class="tile" href="#/provider/${escapeHtml(provider.id)}" data-provider="${escapeHtml(provider.id)}">
-      <h2>${escapeHtml(provider.name)}</h2>
+  appRoot.innerHTML = `${renderTotalTile(summary.total)}<section class="tile-grid">${summary.providers.map((provider) => `
+    <a class="tile${provider.active ? ' tile-active' : ''}" href="#/provider/${escapeHtml(provider.id)}" data-provider="${escapeHtml(provider.id)}">
+      <h2>${escapeHtml(provider.name)} ${activeBadge(provider)}</h2>
       ${provider.ok === false ? `<p class="error">Error: ${escapeHtml(provider.error)}${provider.stale ? ' (showing last good data)' : ''}</p>` : ''}
       <div class="tile-primary">
         <div><span class="big">${formatUsd(provider.costUsd)}</span><span class="label">${escapeHtml(provider.costLabel)}</span></div>
         ${provider.primaryMetric ? `<div><span class="big">${formatCompact(provider.primaryMetric.value)}</span><span class="label">${escapeHtml(provider.primaryMetric.label)}</span></div>` : ''}
       </div>
+      ${windowsTable(provider.windows, { costKind: provider.costKind })}
       <dl class="tile-secondary">${(provider.secondaryMetrics || []).map((metric) => `
         <div><dt>${escapeHtml(metric.label)}</dt><dd>${formatMetric(metric)}</dd></div>`).join('')}
       </dl>
@@ -100,6 +152,39 @@ function barChart(inputRows, { valueKey, labelKey = 'day', format = formatIntege
     return `<rect x="${barX}" y="${barY}" width="${barWidth}" height="${barHeight}" class="bar"><title>${label}: ${escapeHtml(format(row[valueKey]))}</title></rect>${tickLabel}`;
   }).join('');
   return `<figure class="chart"><figcaption>${escapeHtml(title)} — peak ${escapeHtml(format(maxValue))}</figcaption>
+    <svg viewBox="0 0 ${chartWidth} ${chartHeight}" role="img" aria-label="${escapeHtml(title)}">${bars}</svg></figure>`;
+}
+
+// One bar per day, one stacked segment per series (provider).
+function stackedBarChart(inputRows, { series, valueOf, format = formatInteger, title }) {
+  const rows = fillMissingDays(inputRows, '__none');
+  if (!rows.length) return '<p class="muted">No data.</p>';
+  const chartWidth = 900;
+  const chartHeight = 240;
+  const paddingBottom = 40;
+  const paddingLeft = 8;
+  const totals = rows.map((row) => series.reduce((sum, item) => sum + (valueOf(row, item.id) || 0), 0));
+  const maxValue = Math.max(...totals) || 1;
+  const slotWidth = (chartWidth - paddingLeft) / rows.length;
+  const barWidth = Math.min(48, Math.max(2, slotWidth * 0.75));
+  const labelEvery = Math.ceil(rows.length / 12);
+  const plotHeight = chartHeight - paddingBottom - 10;
+  const bars = rows.map((row, index) => {
+    const barX = paddingLeft + index * slotWidth + (slotWidth - barWidth) / 2;
+    let stackTop = chartHeight - paddingBottom;
+    const segments = series.map((item) => {
+      const value = valueOf(row, item.id) || 0;
+      if (!value) return '';
+      const segmentHeight = (value / maxValue) * plotHeight;
+      stackTop -= segmentHeight;
+      return `<rect x="${barX}" y="${stackTop}" width="${barWidth}" height="${segmentHeight}" fill="${item.color}"><title>${escapeHtml(row.day)} ${escapeHtml(item.name)}: ${escapeHtml(format(value))}</title></rect>`;
+    }).join('');
+    const tickLabel = index % labelEvery === 0
+      ? `<text x="${barX + barWidth / 2}" y="${chartHeight - paddingBottom + 14}" text-anchor="middle" class="axis">${escapeHtml(row.day.slice(5))}</text>` : '';
+    return `<g><title>${escapeHtml(row.day)}: ${escapeHtml(format(totals[index]))}</title>${segments}</g>${tickLabel}`;
+  }).join('');
+  const legend = series.map((item) => `<span class="legend-item"><span class="swatch" style="background:${item.color}"></span>${escapeHtml(item.name)}</span>`).join('');
+  return `<figure class="chart"><figcaption>${escapeHtml(title)} — peak ${escapeHtml(format(maxValue))} <span class="legend">${legend}</span></figcaption>
     <svg viewBox="0 0 ${chartWidth} ${chartHeight}" role="img" aria-label="${escapeHtml(title)}">${bars}</svg></figure>`;
 }
 
@@ -200,6 +285,11 @@ function renderBraveDetail(detail) {
       { label: 'Rate limit (req/s)', value: formatInteger(quota.quota.perSecond?.limit) },
     ]) + `<p class="muted">Probed ${escapeHtml(formatDateTime(quota.probedAt))}${quota.throttled ? ' (cached; probes are rate-limited)' : ''}. HTTP ${escapeHtml(quota.httpStatus)}.</p>`;
   }
+  const probeInfo = detail.quotaProbe || {};
+  const probeControls = quota.configured && probeInfo.mode !== 'false'
+    ? `<p class="muted small">Probe mode <code>${escapeHtml(probeInfo.mode)}</code>; this refresh: ${probeInfo.ranThisRefresh ? 'probed' : 'skipped'} (${escapeHtml(probeInfo.reason)}).
+       <button type="button" class="secondary" data-probe="brave">Probe quota now (uses 1 paid query)</button></p>`
+    : `<p class="muted small">Quota probe disabled (${escapeHtml(probeInfo.reason || 'no key')}).</p>`;
   return `
     <p class="note"><strong>${escapeHtml(detail.costLabel)}.</strong> ${escapeHtml(detail.costNote)}</p>
     ${statCards([
@@ -208,8 +298,10 @@ function renderBraveDetail(detail) {
     { label: `Searches ${detail.monthToDate.month}`, value: formatInteger(detail.monthToDate.count) },
     { label: `Est. billed ${detail.monthToDate.month} (after $${detail.pricing.monthlyCreditUsd} credit)`, value: formatUsd(detail.monthToDate.netUsd) },
   ])}
+    ${attributionNote(detail)}
     <h3>Live quota (Brave rate-limit headers)</h3>
     ${quotaSection}
+    ${probeControls}
     <h3>By day</h3>
     ${barChart(detail.byDay, { valueKey: 'count', title: 'Searches per day' })}
     <h3>By agent</h3>
@@ -228,13 +320,93 @@ function renderBraveDetail(detail) {
     ${scanFooter(detail.scan)}`;
 }
 
+function attributionNote(detail) {
+  const attribution = detail.attribution;
+  if (!attribution) return '';
+  return `<p class="muted small">Attribution: ${formatInteger(attribution.recorded)} calls by the provider recorded in the tool result,
+    ${formatInteger(attribution.cutover)} by WEB_SEARCH_PROVIDER_HISTORY cutover time, ${formatInteger(attribution.fallback)} by fallback (pre-history calls default to Brave).</p>`;
+}
+
+function searchBreakdown(detail, { showSpend }) {
+  const spendColumn = showSpend ? [{ label: 'Est. spend', numeric: true, render: (row) => formatUsd(row.estimatedUsd) }] : [];
+  return `
+    <h3>By day</h3>
+    ${barChart(detail.byDay, { valueKey: 'count', title: 'Searches per day' })}
+    <h3>By agent</h3>
+    ${dataTable([{ label: 'Agent', key: 'agent' }, { label: 'Searches', numeric: true, render: (row) => formatInteger(row.count) }, ...spendColumn], detail.byAgent)}
+    <h3>By month</h3>
+    ${dataTable([{ label: 'Month', key: 'month' }, { label: 'Searches', numeric: true, render: (row) => formatInteger(row.count) }], detail.byMonth)}`;
+}
+
+function renderSearxngDetail(detail) {
+  const health = detail.health || {};
+  let healthSection;
+  if (!health.configured) {
+    healthSection = '<p class="muted">Not configured. Set <code>SEARXNG_BASE_URL</code> to check instance health.</p>';
+  } else {
+    healthSection = statCards([
+      { label: 'Status', value: health.ok ? '<span class="ok">up</span>' : '<span class="error">down</span>' },
+      { label: `Latency (${escapeHtml(health.method)})`, value: `${formatInteger(health.latencyMs)} ms` },
+      { label: 'Instance', value: `<code>${escapeHtml(health.baseUrl)}</code>` },
+    ]) + `<p class="muted">Checked ${escapeHtml(formatDateTime(health.checkedAt))}${health.error ? ` — <span class="error">${escapeHtml(health.error)}</span>` : ''}. Health checks are free (self-hosted) and run on every refresh.</p>`;
+  }
+  return `
+    <p class="note"><strong>${escapeHtml(detail.costLabel)}.</strong> ${escapeHtml(detail.costNote)}</p>
+    ${statCards([
+    { label: 'Searches (all time, from transcripts)', value: formatInteger(detail.totalCount) },
+    { label: `Searches ${detail.monthToDate.month}`, value: formatInteger(detail.monthToDate.count) },
+    { label: 'Spend', value: formatUsd(0) },
+  ])}
+    ${attributionNote(detail)}
+    <h3>Instance health</h3>
+    ${healthSection}
+    ${searchBreakdown(detail, { showSpend: false })}
+    ${scanFooter(detail.scan)}`;
+}
+
+async function renderTotalDetail() {
+  const payload = await fetchJson('/api/total');
+  setRefreshedAt(payload.refreshedAt);
+  if (!payload.summary) {
+    appRoot.innerHTML = '<nav class="crumbs"><a href="#/">← All providers</a></nav><p class="muted">No data yet.</p>';
+    return;
+  }
+  const { detail } = payload;
+  const series = detail.providers.map((provider, index) => ({ id: provider.id, name: provider.name, color: providerColor(provider.id, index) }));
+  const searchSeries = series.filter((item) => detail.providers.find((provider) => provider.id === item.id)?.metrics.includes('searches'));
+  const windowCell = (provider, windowId, metric, format) => (provider.metrics.includes(metric) ? format(provider.windows?.[windowId]?.[metric]) : '—');
+  appRoot.innerHTML = `
+    <nav class="crumbs"><a href="#/">← All providers</a></nav>
+    <h2 class="detail-title">All platforms</h2>
+    <p class="note"><strong>Spend mixes three kinds of number.</strong> Actual = billed (SearXNG is self-hosted, $0).
+      API-equivalent = what subscription token usage would cost at API list prices (Claude); it is not a bill.
+      Estimated = request count × list price, unconfirmed by the vendor (Brave, before the monthly credit).
+      Days are in ${escapeHtml(payload.timeZone)}; "7 days" is today plus the six previous days.</p>
+    ${windowsTable(payload.summary.windows, { rows: totalWindowRows() })}
+    <h3>Spend by provider per day</h3>
+    ${stackedBarChart(detail.byDay, { series, valueOf: (row, providerId) => row.byProvider?.[providerId]?.costUsd, format: formatUsd, title: 'Spend per day (stacked by provider)' })}
+    <h3>Searches by provider per day</h3>
+    ${stackedBarChart(detail.byDay, { series: searchSeries, valueOf: (row, providerId) => row.byProvider?.[providerId]?.searches, title: 'Web searches per day (stacked by backend)' })}
+    <h3>Per provider</h3>
+    ${dataTable([
+    { label: 'Provider', render: (row) => `<a href="#/provider/${escapeHtml(row.id)}">${escapeHtml(row.name)}</a> ${activeBadge(row)}${row.ok === false ? ' <span class="error">(error)</span>' : ''}` },
+    { label: 'Spend kind', render: (row) => escapeHtml(CostKindLabels[row.costKind] || row.costKind) },
+    { label: 'Spend today', numeric: true, render: (row) => windowCell(row, 'today', 'costUsd', formatUsd) },
+    { label: 'Spend 7d', numeric: true, render: (row) => windowCell(row, 'last7Days', 'costUsd', formatUsd) },
+    { label: 'Spend all time', numeric: true, render: (row) => windowCell(row, 'allTime', 'costUsd', formatUsd) },
+    { label: 'Tokens', numeric: true, render: (row) => windowCell(row, 'allTime', 'tokens', formatCompact) },
+    { label: 'Searches', numeric: true, render: (row) => windowCell(row, 'allTime', 'searches', formatInteger) },
+    { label: 'Messages', numeric: true, render: (row) => windowCell(row, 'allTime', 'messages', formatInteger) },
+  ], detail.providers)}`;
+}
+
 function scanFooter(scan) {
   if (!scan) return '';
   return `<p class="muted small">Source scan: ${formatInteger(scan.fileCount)} transcript files, ${(scan.totalBytes / 1e6).toFixed(1)} MB,
     ${formatInteger(scan.reparsedFileCount)} re-parsed this refresh, ${scan.durationMs} ms${scan.rootMissing ? ' — transcript directory not found!' : ''}${scan.unreadableFileCount ? `, ${scan.unreadableFileCount} unreadable` : ''}.</p>`;
 }
 
-const DetailRenderers = { claude: renderClaudeDetail, brave: renderBraveDetail };
+const DetailRenderers = { claude: renderClaudeDetail, brave: renderBraveDetail, searxng: renderSearxngDetail };
 
 function renderGenericDetail(detail) {
   return `<pre class="raw">${escapeHtml(JSON.stringify(detail, null, 2))}</pre>`;
@@ -246,8 +418,9 @@ async function renderDetail(providerId) {
   const renderer = DetailRenderers[providerId] || renderGenericDetail;
   appRoot.innerHTML = `
     <nav class="crumbs"><a href="#/">← All providers</a></nav>
-    <h2 class="detail-title">${escapeHtml(payload.summary?.name || providerId)}</h2>
+    <h2 class="detail-title">${escapeHtml(payload.summary?.name || providerId)} ${activeBadge(payload.summary || {})}</h2>
     ${payload.ok === false ? `<p class="error">Last refresh failed: ${escapeHtml(payload.error)}</p>` : ''}
+    ${windowsTable(payload.summary?.windows, { costKind: payload.summary?.costKind })}
     ${payload.detail ? renderer(payload.detail) : '<p class="muted">No data yet.</p>'}`;
 }
 
@@ -255,7 +428,8 @@ async function renderDetail(providerId) {
 async function route() {
   const providerMatch = location.hash.match(/^#\/provider\/([a-z0-9-]+)$/);
   try {
-    if (providerMatch) await renderDetail(providerMatch[1]);
+    if (location.hash === '#/total') await renderTotalDetail();
+    else if (providerMatch) await renderDetail(providerMatch[1]);
     else renderTiles(await fetchJson('/api/summary'));
   } catch (error) {
     appRoot.innerHTML = `<p class="error">Failed to load: ${escapeHtml(error.message)}</p>`;
@@ -273,6 +447,20 @@ refreshButton.addEventListener('click', async () => {
   } finally {
     refreshButton.disabled = false;
     refreshButton.textContent = 'Refresh';
+  }
+});
+
+// Explicit paid probe (e.g. Brave quota while SearXNG is the active backend).
+appRoot.addEventListener('click', async (event) => {
+  const probeButton = event.target.closest('button[data-probe]');
+  if (!probeButton) return;
+  probeButton.disabled = true;
+  probeButton.textContent = 'Probing…';
+  try {
+    await fetchJson(`/api/refresh?probe=${encodeURIComponent(probeButton.dataset.probe)}`, { method: 'POST' });
+    await route();
+  } catch (error) {
+    appRoot.insertAdjacentHTML('afterbegin', `<p class="error">Probe failed: ${escapeHtml(error.message)}</p>`);
   }
 });
 

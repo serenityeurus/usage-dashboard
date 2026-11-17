@@ -1,6 +1,7 @@
 // Aggregates OpenClaw web_search tool calls (found in Claude Code transcripts)
-// into a Brave usage history with estimated spend.
-import { friendlyProjectName, localDay, localMonth, roundUsd } from '../../util.js';
+// into a usage history (by day, agent, month) with estimated spend. Shared by
+// every search backend; self-hosted ones pass costPer1k = 0.
+import { friendlyProjectName, localDay, localMonth, roundUsd } from './util.js';
 
 export function aggregateWebSearchCalls(webSearchCalls, { timeZone, costPer1k, monthlyCreditUsd, now = new Date() }) {
   const byDay = new Map();
@@ -36,5 +37,13 @@ export function aggregateWebSearchCalls(webSearchCalls, { timeZone, costPer1k, m
       .map(([agent, count]) => ({ agent, count, estimatedUsd: estimateUsd(count) })),
     byMonth: [...byMonth.entries()].sort(([left], [right]) => left.localeCompare(right))
       .map(([month, count]) => monthRow(month, count)),
+  };
+}
+
+// Normalized per-day series for time windows and the all-platforms total.
+export function searchTimeSeries(history) {
+  return {
+    metrics: ['costUsd', 'searches'],
+    byDay: history.byDay.map((row) => ({ day: row.day, costUsd: row.estimatedUsd, searches: row.count })),
   };
 }
