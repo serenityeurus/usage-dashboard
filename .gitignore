@@ -1,0 +1,12 @@
+# secrets / local config
+usage-dashboard.env
+.env
+*.env
+!usage-dashboard.example.env
+
+# dependencies / build
+node_modules/
+
+# OS / editor
+.DS_Store
+*.log

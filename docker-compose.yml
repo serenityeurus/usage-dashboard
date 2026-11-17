@@ -1,0 +1,25 @@
+services:
+  usage-dashboard:
+    build: .
+    image: usage-dashboard:local
+    container_name: usage-dashboard
+    restart: unless-stopped
+    env_file:
+      - path: usage-dashboard.env
+        required: false
+    environment:
+      PORT: "8787"
+      LISTEN_HOST: 0.0.0.0
+      CLAUDE_PROJECTS_DIR: /data/claude-projects
+      PRICING_FILE: /app/config/pricing.json
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8787}:8787"
+    volumes:
+      - "${CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}:/data/claude-projects:ro"
+      # Pricing is mounted so edits apply on the next Refresh without a rebuild.
+      - ./config/pricing.json:/app/config/pricing.json:ro
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
