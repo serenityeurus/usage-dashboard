@@ -12,6 +12,13 @@ services:
       LISTEN_HOST: 0.0.0.0
       CLAUDE_PROJECTS_DIR: /data/claude-projects
       PRICING_FILE: /app/config/pricing.json
+      # The browser's Host header carries the host-side port; the Host allowlist needs it.
+      HOST_PORT: "${HOST_PORT:-8787}"
+      # SearXNG runs on the host; host.docker.internal reaches it from the container.
+      SEARXNG_BASE_URL: "${SEARXNG_BASE_URL:-http://host.docker.internal:8888}"
+    extra_hosts:
+      # Docker Desktop provides host.docker.internal already; this makes Linux engines match.
+      - "host.docker.internal:host-gateway"
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8787}:8787"
     volumes:

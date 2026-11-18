@@ -4,6 +4,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createDashboardState } from '../src/dashboard-state.js';
+import { createHostPolicy } from '../src/http-guard.js';
 import { createRequestHandler } from '../src/server.js';
 import { friendlyProjectName } from '../src/util.js';
 import { fetchAdminUsage, summarizeCostBuckets } from '../src/providers/claude/admin-api.js';
@@ -23,6 +24,7 @@ describe('friendlyProjectName', () => {
 describe('dashboard state and HTTP API', () => {
   let server;
   let baseUrl;
+  let port;
   let collectCount = 0;
   let scanCount = 0;
 
@@ -42,34 +44,144 @@ describe('dashboard state and HTTP API', () => {
     ];
     const dashboardState = createDashboardState({ providers, transcriptScanner });
     await dashboardState.refresh('startup');
-    server = http.createServer(createRequestHandler({ dashboardState, publicDir: PublicDir }));
+    server = http.createServer();
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-    baseUrl = `http://127.0.0.1:${server.address().port}`;
+    port = server.address().port;
+    // The policy needs the real port, which only exists after listen().
+    const hostPolicy = createHostPolicy({ ports: [port], extraHosts: ['dashboard.lan'] });
+    server.on('request', createRequestHandler({ dashboardState, publicDir: PublicDir, hostPolicy }));
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  // fetch() cannot override Host, so raw requests go through node:http.
+  function rawRequest({ method = 'GET', path: requestPath, headers = {} }) {
+    return new Promise((resolve, reject) => {
+      const request = http.request({ host: '127.0.0.1', port, method, path: requestPath, headers, setHost: !('host' in headers) }, (response) => {
+        let body = '';
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body }));
+      });
+      request.on('error', reject);
+      request.end();
+    });
+  }
+
+  it('rejects requests whose Host header is not allowed (DNS rebinding)', async () => {
+    for (const host of ['evil.example', `evil.example:${port}`, '127.0.0.1:1', `localhost.evil.example:${port}`, '', 'localhost:99999', 'a b']) {
+      const response = await rawRequest({ path: '/api/summary', headers: { host } });
+      assert.equal(response.status, 403, `host "${host}"`);
+    }
+    for (const host of [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`, 'localhost', `LOCALHOST.:${port}`, `dashboard.lan:${port}`]) {
+      const response = await rawRequest({ path: '/healthz', headers: { host } });
+      assert.equal(response.status, 200, `host "${host}"`);
+    }
+  });
+
+  it('rejects a POST with a foreign or opaque Origin, allows same-origin and no Origin', async () => {
+    const before = collectCount;
+    for (const origin of ['https://evil.example', `http://evil.example:${port}`, 'null', 'not a url', `file://localhost:${port}`]) {
+      const response = await rawRequest({ method: 'POST', path: '/api/refresh', headers: { origin } });
+      assert.equal(response.status, 403, `origin "${origin}"`);
+    }
+    assert.equal(collectCount, before, 'a rejected POST must not trigger a refresh');
+    const sameOrigin = await rawRequest({ method: 'POST', path: '/api/refresh', headers: { origin: `http://localhost:${port}` } });
+    assert.equal(sameOrigin.status, 200);
+    const noOrigin = await rawRequest({ method: 'POST', path: '/api/refresh' });
+    assert.equal(noOrigin.status, 200);
+    // GETs are not state-changing: a cross-origin Origin header alone does not block them.
+    assert.equal((await rawRequest({ path: '/healthz', headers: { origin: 'https://evil.example' } })).status, 200);
+  });
+
+  it('rejects Origins on a default port (80/443) that is not the dashboard port', async () => {
+    const before = collectCount;
+    for (const origin of ['http://localhost', 'https://localhost', 'http://127.0.0.1:80']) {
+      for (const requestPath of ['/api/refresh?probe=brave', '/api/nonexistent']) {
+        const response = await rawRequest({ method: 'POST', path: requestPath, headers: { origin } });
+        assert.equal(response.status, 403, `${origin} ${requestPath}`);
+        assert.match(response.body, /cross-origin/);
+      }
+    }
+    assert.equal(collectCount, before);
+    // Passes the guard and reaches routing (404), rather than 403.
+    const allowed = await rawRequest({ method: 'POST', path: '/api/nonexistent', headers: { origin: `http://localhost:${port}` } });
+    assert.equal(allowed.status, 404);
+  });
+
+  it('answers HEAD like GET and 405 (with Allow) for other methods on API routes', async () => {
+    for (const requestPath of ['/healthz', '/api/summary', '/api/total', '/api/providers/good']) {
+      const head = await rawRequest({ method: 'HEAD', path: requestPath });
+      assert.equal(head.status, 200, `HEAD ${requestPath}`);
+      assert.equal(head.body, '');
+      assert.equal(head.headers['content-type'], 'application/json; charset=utf-8');
+      for (const method of ['OPTIONS', 'PUT', 'DELETE']) {
+        const response = await rawRequest({ method, path: requestPath });
+        assert.equal(response.status, 405, `${method} ${requestPath}`);
+        assert.equal(response.headers.allow, 'GET, HEAD');
+      }
+    }
+    const refreshHead = await rawRequest({ method: 'HEAD', path: '/api/refresh' });
+    assert.equal(refreshHead.status, 405);
+    assert.equal(refreshHead.headers.allow, 'POST');
+    assert.equal((await rawRequest({ method: 'OPTIONS', path: '/api/nonexistent' })).status, 404);
+    assert.equal((await rawRequest({ method: 'HEAD', path: '/api/providers/nope' })).status, 404);
+    const staticOptions = await rawRequest({ method: 'OPTIONS', path: '/' });
+    assert.equal(staticOptions.status, 405);
+    assert.equal(staticOptions.headers.allow, 'GET, HEAD');
+  });
+
+  it('exposes the current day range in the summary, total and provider payloads', async () => {
+    const summary = await (await fetch(`${baseUrl}/api/summary`)).json();
+    assert.match(summary.range.today, /^\d{4}-\d{2}-\d{2}$/);
+    const total = await (await fetch(`${baseUrl}/api/total`)).json();
+    assert.equal(total.range.today, summary.range.today);
+    const detail = await (await fetch(`${baseUrl}/api/providers/good`)).json();
+    assert.equal(detail.range.today, summary.range.today);
+  });
+
+  it('returns 400, not 500, for malformed percent-encoding in the path', async () => {
+    for (const badPath of ['/%E0%A4%A', '/%', '/%zz', '/app.js%']) {
+      const response = await rawRequest({ path: badPath });
+      assert.equal(response.status, 400, badPath);
+      assert.match(response.body, /malformed/);
+    }
+    assert.equal((await rawRequest({ path: '/%00' })).status, 400);
+    assert.equal((await rawRequest({ path: '/app%2Ejs' })).status, 200); // valid encoding still works
+  });
+
+  it('serves the all-platforms total', async () => {
+    const summary = await (await fetch(`${baseUrl}/api/summary`)).json();
+    assert.equal(summary.total.id, 'total');
+    assert.ok(summary.total.windows.allTime);
+    const total = await (await fetch(`${baseUrl}/api/total`)).json();
+    assert.ok(Array.isArray(total.detail.byDay));
   });
 
   after(() => server.close());
 
   it('shares one transcript scan between providers per refresh', () => {
-    assert.equal(scanCount, 1);
+    assert.equal(scanCount, collectCount); // two providers, one scan per refresh
   });
 
   it('serves cached summaries without re-collecting', async () => {
+    const collectsBefore = collectCount;
     const body = await (await fetch(`${baseUrl}/api/summary`)).json();
-    assert.equal(collectCount, 1);
-    assert.equal(body.providers.find((row) => row.id === 'good').costUsd, 1);
+    assert.equal(collectCount, collectsBefore);
+    assert.equal(body.providers.find((row) => row.id === 'good').costUsd, collectCount);
     const badProvider = body.providers.find((row) => row.id === 'bad');
     assert.equal(badProvider.ok, false);
     assert.equal(badProvider.error, 'boom');
   });
 
   it('re-collects on POST /api/refresh and coalesces concurrent refreshes', async () => {
+    const collectsBefore = collectCount;
+    const scansBefore = scanCount;
     const responses = await Promise.all([
       fetch(`${baseUrl}/api/refresh`, { method: 'POST' }),
       fetch(`${baseUrl}/api/refresh`, { method: 'POST' }),
     ]);
     assert.deepEqual(responses.map((response) => response.status), [200, 200]);
-    assert.equal(collectCount, 2);
-    assert.equal(scanCount, 2);
+    assert.equal(collectCount - collectsBefore, 1);
+    assert.equal(scanCount - scansBefore, 1);
   });
 
   it('rejects GET on the refresh endpoint', async () => {
@@ -78,7 +190,7 @@ describe('dashboard state and HTTP API', () => {
 
   it('returns provider detail and 404 for unknown providers', async () => {
     const detail = await (await fetch(`${baseUrl}/api/providers/good`)).json();
-    assert.equal(detail.detail.collectCount, 2);
+    assert.equal(detail.detail.collectCount, collectCount);
     const missing = await fetch(`${baseUrl}/api/providers/nope`);
     assert.equal(missing.status, 404);
   });
