@@ -50,7 +50,9 @@ describe('http-guard', () => {
     assert.ok(policy.isAllowedHost('proxy.lan:443'));
     assert.ok(!policy.isAllowedHost('localhost:22'));
     assert.ok(!policy.isAllowedHost('dash.lan:22'));
-    assert.ok(!policy.isAllowedHost('proxy.lan'));
+    // A bare Host matches a host:443 entry, since clients omit default ports (reverse proxy case).
+    assert.ok(policy.isAllowedHost('proxy.lan'));
+    assert.ok(!policy.isAllowedHost('proxy.lan:8443'));
     assert.ok(!policy.isAllowedHost('rebind.attacker.example:8787'));
     assert.ok(policy.isAllowedOrigin('http://localhost:8787'));
     assert.ok(!policy.isAllowedOrigin('http://localhost:8787.evil.example'));

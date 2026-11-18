@@ -75,6 +75,9 @@ export function createHostPolicy({ allowedHosts = DefaultAllowedHosts, extraHost
     const parsed = parseHostHeader(hostHeader);
     if (!parsed) return false;
     if (parsed.port != null && exactHosts.has(`${parsed.hostname}:${parsed.port}`)) return true;
+    // Clients omit default ports from Host (RFC 9110 §7.2), so a reverse proxy on 80/443
+    // sends a bare `Host: dash.lan`; let that match a `dash.lan:80` or `dash.lan:443` entry.
+    if (parsed.port == null && (exactHosts.has(`${parsed.hostname}:80`) || exactHosts.has(`${parsed.hostname}:443`))) return true;
     if (!anyPortHosts.has(parsed.hostname)) return false;
     return parsed.port == null || portSet.has(parsed.port);
   }
