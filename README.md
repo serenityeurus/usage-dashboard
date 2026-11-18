@@ -53,7 +53,12 @@ Each provider returns a normalized per-day series (`timeSeries` in the adapter c
 
 Windows and the total are recomputed from the stored per-day series on every read (`/api/summary`, `/api/total`, `/api/providers/:id`), not when the data is refreshed. "Today" therefore rolls over at local midnight without a Refresh, and a provider whose last refresh failed (its previous data is shown, marked stale) is windowed against the current day too. The page header shows the day currently used as "today". Claude's windows sum unrounded per-day cost and round once, so `allTime` matches the Claude tile's all-time cost.
 
-The **All platforms** tile (`total` in `/api/summary`, full payload at `/api/total`) adds the windows of every provider. Spend is labelled by kind, because the numbers are not the same sort of money:
+The **All platforms** tile (`total` in `/api/summary`, full payload at `/api/total`) adds the windows of every provider. It never leads with one combined "total spend", because a bill and an estimate are not the same sort of money. Instead every window (today, 7 days, all time) has two headline figures:
+
+- **Actual spend** (`actualUsd`): the sum of `actual`-kind cost, i.e. what was billed. It reads $0.00 with the hint "no billing source connected" while no provider reports a non-zero actual cost (SearXNG is actual but always $0).
+- **Estimated spend** (`estimatedUsd`): `api-equivalent` + `estimated`, shown with those two sub-lines so the Claude part is clearly not a bill.
+
+Both are computed in `src/total.js` from unrounded sums and rounded once. `costUsd` (all three kinds added) and `costByKind` remain in the payload for backward compatibility, but the UI does not show `costUsd` as a headline. The kinds:
 
 | Kind | Meaning | Provider |
 | --- | --- | --- |
@@ -61,7 +66,7 @@ The **All platforms** tile (`total` in `/api/summary`, full payload at `/api/tot
 | API-equivalent | What subscription token usage would cost at API list prices; not a bill | Claude |
 | Estimated | Request count × list price, unconfirmed by the vendor, before credits | Brave |
 
-The combined breakdown shows spend per day stacked by provider, searches per day stacked by backend (which makes the Brave → SearXNG cutover visible) and a per-provider table.
+The combined breakdown shows spend per day stacked by provider (each legend entry names the provider's kind; the bars are estimated or API-equivalent unless marked Actual; per-day costs are summed unrounded and rounded once), searches per day stacked by backend (which makes the Brave → SearXNG cutover visible) and a per-provider table.
 
 ### Claude: API-equivalent cost (subscription)
 

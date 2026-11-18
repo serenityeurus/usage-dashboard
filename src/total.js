@@ -4,6 +4,9 @@
 //   actual          what was (or will be) billed, e.g. a self-hosted $0
 //   api-equivalent  what subscription usage would cost at API list prices
 //   estimated       count × list price, not confirmed by the vendor
+// The headline figures are actualUsd (actual only) and estimatedUsd
+// (api-equivalent + estimated). costUsd, the sum of all three, is kept for
+// backward compatibility but must not be shown as one "total spend".
 import { roundUsd } from './util.js';
 import { WindowIds } from './windows.js';
 
@@ -13,6 +16,8 @@ const CountMetrics = ['tokens', 'searches', 'messages'];
 function emptyTotalWindow() {
   return {
     costUsd: 0,
+    actualUsd: 0,
+    estimatedUsd: 0,
     costByKind: Object.fromEntries(CostKinds.map((kind) => [kind, 0])),
     tokens: 0,
     searches: 0,
@@ -51,8 +56,9 @@ export function computeTotal(entries) {
     for (const row of entry.timeSeries?.byDay || []) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(row.day)) continue;
       if (!dayMap.has(row.day)) dayMap.set(row.day, {});
+      // Unrounded here; the day total and each provider cell are rounded once below.
       dayMap.get(row.day)[summary.id] = {
-        costUsd: roundUsd(Number(row.costUsd) || 0),
+        costUsd: Number(row.costUsd) || 0,
         searches: Number(row.searches) || 0,
         tokens: Number(row.tokens) || 0,
       };
@@ -61,6 +67,9 @@ export function computeTotal(entries) {
 
   for (const windowId of WindowIds) {
     const window = windows[windowId];
+    // Derived from the unrounded per-kind sums, then rounded once.
+    window.actualUsd = roundUsd(window.costByKind.actual);
+    window.estimatedUsd = roundUsd(window.costByKind['api-equivalent'] + window.costByKind.estimated);
     window.costUsd = roundUsd(window.costUsd);
     for (const kind of CostKinds) window.costByKind[kind] = roundUsd(window.costByKind[kind]);
   }
@@ -70,7 +79,8 @@ export function computeTotal(entries) {
       day,
       costUsd: roundUsd(Object.values(byProvider).reduce((sum, row) => sum + row.costUsd, 0)),
       searches: Object.values(byProvider).reduce((sum, row) => sum + row.searches, 0),
-      byProvider,
+      byProvider: Object.fromEntries(Object.entries(byProvider)
+        .map(([providerId, row]) => [providerId, { ...row, costUsd: roundUsd(row.costUsd) }])),
     }));
 
   return {

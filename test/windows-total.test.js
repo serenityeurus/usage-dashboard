@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import { loadConfig } from '../src/config.js';
 import { createDashboardState } from '../src/dashboard-state.js';
 import { computeTotal } from '../src/total.js';
+import { roundUsd } from '../src/util.js';
 import { computeWindows, shiftDay } from '../src/windows.js';
 
 // 2026-11-17T03:30Z is still 2026-11-16 in Detroit (UTC-5): day boundaries are local.
@@ -69,10 +70,48 @@ describe('computeTotal', () => {
   it('sums spend by cost kind and counts across providers', () => {
     const total = computeTotal(entries);
     assert.deepEqual(total.summary.windows.allTime, {
-      costUsd: 30.1, costByKind: { actual: 0, 'api-equivalent': 30, estimated: 0.1 }, tokens: 300, searches: 23, messages: 6,
+      costUsd: 30.1, actualUsd: 0, estimatedUsd: 30.1, costByKind: { actual: 0, 'api-equivalent': 30, estimated: 0.1 }, tokens: 300, searches: 23, messages: 6,
     });
     assert.equal(total.summary.windows.today.searches, 5);
     assert.equal(total.summary.providerCount, 4);
+  });
+
+  it('splits every window into actual and estimated (api-equivalent + estimated) spend', () => {
+    const billed = {
+      ok: true,
+      summary: { id: 'billing', name: 'Billing', costKind: 'actual', windows: { today: { costUsd: 1.25 }, last7Days: { costUsd: 2.5 }, allTime: { costUsd: 7.75 } } },
+      timeSeries: { byDay: [{ day: '2026-11-16', costUsd: 1.25 }] },
+    };
+    const total = computeTotal([...entries, billed]);
+    const split = Object.fromEntries(['today', 'last7Days', 'allTime'].map((windowId) => {
+      const window = total.summary.windows[windowId];
+      return [windowId, [window.actualUsd, window.estimatedUsd]];
+    }));
+    assert.deepEqual(split, { today: [1.25, 10.01], last7Days: [2.5, 20.02], allTime: [7.75, 30.1] });
+    for (const window of Object.values(total.summary.windows)) {
+      assert.equal(window.actualUsd, window.costByKind.actual);
+      assert.equal(window.estimatedUsd, roundUsd(window.costByKind['api-equivalent'] + window.costByKind.estimated));
+    }
+  });
+
+  it('reports zero actual spend when no provider bills anything', () => {
+    const total = computeTotal(entries); // SearXNG is actual-kind but $0
+    for (const window of Object.values(total.summary.windows)) assert.equal(window.actualUsd, 0);
+    assert.equal(computeTotal([]).summary.windows.allTime.estimatedUsd, 0);
+  });
+
+  it('rounds estimatedUsd once from unrounded per-kind sums', () => {
+    const tiny = (id, costKind, costUsd) => ({ ok: true, summary: { id, name: id, costKind, windows: { today: { costUsd }, last7Days: { costUsd }, allTime: { costUsd } } }, timeSeries: null });
+    // roundUsd keeps 6 decimals: 4e-7 + 4e-7 = 8e-7 → 1e-6, whereas summing pre-rounded parts gives 0.
+    const total = computeTotal([tiny('a', 'api-equivalent', 4e-7), tiny('b', 'estimated', 4e-7)]);
+    assert.equal(total.summary.windows.allTime.estimatedUsd, 1e-6);
+  });
+
+  it('sums unrounded per-provider daily cost and rounds the day total once', () => {
+    const daily = (id, costUsd) => ({ ok: true, summary: { id, name: id, costKind: 'estimated' }, timeSeries: { byDay: [{ day: '2026-11-16', costUsd }] } });
+    const total = computeTotal([daily('a', 4e-7), daily('b', 4e-7), daily('c', 4e-7)]);
+    assert.equal(total.detail.byDay[0].costUsd, 1e-6, '1.2e-6 rounds to 1e-6; rounding each cell first would give 0');
+    assert.deepEqual(Object.values(total.detail.byDay[0].byProvider).map((row) => row.costUsd), [0, 0, 0], 'cells are rounded at output');
   });
 
   it('builds a per-day, per-provider breakdown without undated rows', () => {

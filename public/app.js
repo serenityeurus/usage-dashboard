@@ -52,6 +52,8 @@ const MetricFormats = {
   messages: ['Messages', formatInteger],
 };
 const CostKindLabels = { actual: 'Actual', 'api-equivalent': 'API-equivalent', estimated: 'Estimated' };
+const EstimatedKinds = ['api-equivalent', 'estimated'];
+const NoActualHint = 'no billing source connected';
 const ProviderColors = { claude: '#d97757', brave: '#fb542b', searxng: '#3fa7d6', 'other-search': '#9e9e9e' };
 const FallbackColors = ['#8bc34a', '#ab47bc', '#ffca28', '#26a69a', '#ec407a'];
 const providerColor = (providerId, index) => ProviderColors[providerId] || FallbackColors[index % FallbackColors.length];
@@ -69,8 +71,12 @@ function windowsTable(windows, { costKind, rows } = {}) {
 
 function totalWindowRows() {
   return [
-    { label: 'Total spend', value: (window) => formatUsd(window?.costUsd), className: 'strong' },
-    ...Object.entries(CostKindLabels).map(([kind, label]) => ({ label: `  ${label}`, value: (window) => formatUsd(window?.costByKind?.[kind]), className: 'sub' })),
+    // Two headlines, never one combined "total spend": a bill and an estimate
+    // are not the same sort of money. costUsd stays in the payload only for
+    // backward compatibility.
+    { label: 'Actual spend (billed)', value: (window) => formatUsd(window?.actualUsd), className: 'strong' },
+    { label: 'Estimated spend (not billed)', value: (window) => formatUsd(window?.estimatedUsd), className: 'strong' },
+    ...EstimatedKinds.map((kind) => ({ label: `  ${CostKindLabels[kind]}`, value: (window) => formatUsd(window?.costByKind?.[kind]), className: 'sub' })),
     { label: 'Tokens', value: (window) => formatCompact(window?.tokens) },
     { label: 'Searches (all providers)', value: (window) => formatInteger(window?.searches) },
     { label: 'Messages', value: (window) => formatInteger(window?.messages) },
@@ -86,13 +92,15 @@ function activeBadge(provider) {
 
 function renderTotalTile(total) {
   if (!total) return '';
+  const allTime = total.windows.allTime;
   return `<a class="tile tile-total" href="#/total" data-provider="total">
       <h2>${escapeHtml(total.name)} <span class="muted small">${formatInteger(total.providerCount)} providers</span></h2>
       <div class="tile-primary">
-        <div><span class="big">${formatUsd(total.windows.allTime.costUsd)}</span><span class="label">Total spend, all time (actual + API-equivalent + estimated)</span></div>
-        <div><span class="big">${formatCompact(total.windows.allTime.tokens)}</span><span class="label">Tokens</span></div>
-        <div><span class="big">${formatInteger(total.windows.allTime.searches)}</span><span class="label">Searches</span></div>
-        <div><span class="big">${formatInteger(total.windows.allTime.messages)}</span><span class="label">Messages</span></div>
+        <div><span class="big">${formatUsd(allTime.actualUsd)}</span><span class="label">Actual spend, all time${allTime.actualUsd ? ' (billed)' : ` (${NoActualHint})`}</span></div>
+        <div><span class="big">${formatUsd(allTime.estimatedUsd)}</span><span class="label">Estimated spend, all time (API-equivalent ${formatUsd(allTime.costByKind?.['api-equivalent'])} + estimated ${formatUsd(allTime.costByKind?.estimated)}; not a bill)</span></div>
+        <div><span class="big">${formatCompact(allTime.tokens)}</span><span class="label">Tokens</span></div>
+        <div><span class="big">${formatInteger(allTime.searches)}</span><span class="label">Searches</span></div>
+        <div><span class="big">${formatInteger(allTime.messages)}</span><span class="label">Messages</span></div>
       </div>
       ${windowsTable(total.windows, { rows: totalWindowRows() })}
       <span class="tile-cta">View combined breakdown →</span>
@@ -387,18 +395,23 @@ async function renderTotalDetail() {
   }
   const { detail } = payload;
   const series = detail.providers.map((provider, index) => ({ id: provider.id, name: provider.name, color: providerColor(provider.id, index) }));
+  // Spend legend carries each provider's cost kind, so the stacked bars cannot be read as one bill.
+  const spendSeries = series.map((item, index) => {
+    const costKind = detail.providers[index].costKind;
+    return { ...item, name: `${item.name} (${CostKindLabels[costKind] || costKind})` };
+  });
   const searchSeries = series.filter((item) => detail.providers.find((provider) => provider.id === item.id)?.metrics.includes('searches'));
   const windowCell = (provider, windowId, metric, format) => (provider.metrics.includes(metric) ? format(provider.windows?.[windowId]?.[metric]) : '—');
   appRoot.innerHTML = `
     <nav class="crumbs"><a href="#/">← All providers</a></nav>
     <h2 class="detail-title">All platforms</h2>
-    <p class="note"><strong>Spend mixes three kinds of number.</strong> Actual = billed (SearXNG is self-hosted, $0).
-      API-equivalent = what subscription token usage would cost at API list prices (Claude); it is not a bill.
-      Estimated = request count × list price, unconfirmed by the vendor (Brave, before the monthly credit).
+    <p class="note"><strong>Actual and estimated spend are shown separately, never added.</strong> Actual = billed (SearXNG is self-hosted, $0)${payload.summary.windows.allTime.actualUsd ? '' : `; ${NoActualHint}`}.
+      Estimated = API-equivalent + estimated. API-equivalent = what subscription token usage would cost at API list prices (Claude); it is not a bill.
+      Brave's part is request count × list price, unconfirmed by the vendor and before the monthly credit.
       Days are in ${escapeHtml(payload.timeZone)}; "7 days" is today plus the six previous days.</p>
     ${windowsTable(payload.summary.windows, { rows: totalWindowRows() })}
-    <h3>Spend by provider per day</h3>
-    ${stackedBarChart(detail.byDay, { series, valueOf: (row, providerId) => row.byProvider?.[providerId]?.costUsd, format: formatUsd, title: 'Spend per day (stacked by provider)' })}
+    <h3>Spend by provider per day (estimated / API-equivalent unless marked actual)</h3>
+    ${stackedBarChart(detail.byDay, { series: spendSeries, valueOf: (row, providerId) => row.byProvider?.[providerId]?.costUsd, format: formatUsd, title: 'Spend per day by kind (stacked by provider; not a bill unless actual)' })}
     <h3>Searches by provider per day</h3>
     ${stackedBarChart(detail.byDay, { series: searchSeries, valueOf: (row, providerId) => row.byProvider?.[providerId]?.searches, title: 'Web searches per day (stacked by backend)' })}
     <h3>Per provider</h3>
