@@ -11,5 +11,5 @@
     "start": "node src/server.js",
     "test": "node --test test/"
   },
-  "license": "UNLICENSED"
+  "license": "MIT"
 }

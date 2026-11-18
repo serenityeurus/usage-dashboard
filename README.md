@@ -180,3 +180,7 @@ HEAD is answered wherever GET is (same status and headers, no body), as for the 
 - The active-provider badge comes from `WEB_SEARCH_PROVIDER`, not from OpenClaw's live config, so it can drift if one is changed without the other. When unset, it is only as current as the last recorded search.
 - Windows roll over at midnight on the next API read, but an open page does not poll: reload or navigate to see the new day. Month-to-date figures (e.g. "Searches 2026-11") are still fixed at refresh time.
 - There is no authentication. Keep `BIND_ADDRESS=127.0.0.1` or put the dashboard behind a reverse proxy that handles auth.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
