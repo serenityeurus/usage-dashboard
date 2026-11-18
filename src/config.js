@@ -75,8 +75,26 @@ export function parseWeeklyReset(rawValue) {
   return { mode: 'fixed', dayOfWeek, hour, minute, label };
 }
 
+// Seconds after which a status line capture is labelled stale (still shown
+// as a lower bound until its windows reset; see official-quota.js).
+function positiveIntegerFromEnv(environment, key, fallback) {
+  const rawValue = String(environment[key] ?? '').trim();
+  if (rawValue === '') return fallback;
+  const value = Number(rawValue);
+  if (!/^\d+$/.test(rawValue) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${key} must be a positive integer, got "${environment[key]}"`);
+  }
+  return value;
+}
+
+export function defaultStatuslineStateFile(environment = process.env) {
+  return path.join(environment.HOME || process.env.HOME || '/', '.claude', 'usage-dashboard', 'rate-limits.json');
+}
+
 export function loadClaudeQuotaConfig(environment = {}) {
   return {
+    statuslineStateFile: environment.USAGE_DASHBOARD_STATE_FILE || null,
+    statuslineMaxAgeSeconds: positiveIntegerFromEnv(environment, 'CLAUDE_STATUSLINE_MAX_AGE_SECONDS', 900),
     metric: enumFromEnv(environment, 'CLAUDE_QUOTA_METRIC', ['usd', 'tokens'], 'usd'),
     limits: {
       session: { tokens: limitFromEnv(environment, 'CLAUDE_SESSION_LIMIT_TOKENS'), usd: limitFromEnv(environment, 'CLAUDE_SESSION_LIMIT_USD') },
@@ -138,6 +156,6 @@ export function loadConfig(environment = process.env) {
     searxngBaseUrl,
     searxngTimeoutSeconds: numberFromEnv(environment, 'SEARXNG_TIMEOUT_SECONDS', 5),
     autoRefreshSeconds: autoRefreshSecondsFromEnv(environment),
-    claudeQuota: loadClaudeQuotaConfig(environment),
+    claudeQuota: { ...loadClaudeQuotaConfig(environment), statuslineStateFile: environment.USAGE_DASHBOARD_STATE_FILE || defaultStatuslineStateFile(environment) },
   };
 }

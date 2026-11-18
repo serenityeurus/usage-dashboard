@@ -161,7 +161,9 @@ describe('Claude quota percentages and configuration', () => {
   });
 
   it('validates the quota and auto-refresh environment', () => {
-    assert.deepEqual(loadConfig({}).claudeQuota, {
+    assert.deepEqual(loadConfig({ HOME: '/home/u' }).claudeQuota, {
+      statuslineStateFile: '/home/u/.claude/usage-dashboard/rate-limits.json',
+      statuslineMaxAgeSeconds: 900,
       metric: 'usd', limits: { session: { tokens: null, usd: null }, weekly: { tokens: null, usd: null } }, weeklyReset: { mode: 'rolling', label: 'rolling 7 days' },
     });
     assert.throws(() => loadConfig({ CLAUDE_SESSION_LIMIT_USD: '0' }), /CLAUDE_SESSION_LIMIT_USD must be a positive number/);

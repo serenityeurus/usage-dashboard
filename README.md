@@ -1,7 +1,7 @@
 # usage-dashboard
 
 A self-hosted dashboard for usage and spend across AI and API providers. It currently tracks **Claude**, **Brave Search** and **SearXNG** (self-hosted search).
-The main page starts with an **All platforms** tile (combined spend, tokens, searches and messages), followed by one tile per provider. Every tile shows **today**, **the last 7 days** and **all time**. Click a tile to open its breakdown. **Refresh** re-reads every source on the server; the server also re-reads them on its own every 5 minutes (configurable), and an open tab follows along. The Claude tile adds an **estimate** of how much of your plan's 5-hour session and weekly limits you have used.
+The main page starts with an **All platforms** tile (combined spend, tokens, searches and messages), followed by one tile per provider. Every tile shows **today**, **the last 7 days** and **all time**. Click a tile to open its breakdown. **Refresh** re-reads every source on the server; the server also re-reads them on its own every 5 minutes (configurable), and an open tab follows along. The Claude tile shows how much of your plan's 5-hour session and weekly limits you have used: Claude Code's own **official** `/usage` percentages when the status line has captured them, otherwise an **estimate**.
 
 - Stack: Node 22 with no runtime dependencies (`node:http` plus `node:test`) and a vanilla JS/SVG frontend.
 - Runs in Docker as a non-root user with a read-only root filesystem, read-only data mounts and a healthcheck.
@@ -13,6 +13,13 @@ cp usage-dashboard.example.env usage-dashboard.env   # then fill in values
 ln -s usage-dashboard.env .env                       # compose reads HOST_PORT/BIND_ADDRESS from .env
 docker compose up -d --build
 open http://127.0.0.1:8787/
+```
+
+For official Claude `/usage` figures, also install the status line once (see [Claude: official /usage](#claude-official-usage-status-line)):
+
+```sh
+mkdir -p ~/.claude/usage-dashboard                   # before the first compose up, so Docker mounts it
+node scripts/install-statusline.mjs --dry-run        # then without --dry-run
 ```
 
 To run without Docker: `npm start` (honours the same env vars; see `node src/server.js --help`).
@@ -42,6 +49,9 @@ To run the tests: `npm test`.
 | `CLAUDE_QUOTA_METRIC` | `usd` | What the Claude plan-limit estimate measures: `usd` (API-equivalent cost) or `tokens` (all tokens, cache reads included). See [Claude: plan limits](#claude-plan-limits-estimate). |
 | `CLAUDE_SESSION_LIMIT_USD`, `CLAUDE_WEEKLY_LIMIT_USD` | empty | Your calibrated 5-hour and weekly limits in API-equivalent USD (used when the metric is `usd`). Empty = no limit for that window. |
 | `CLAUDE_SESSION_LIMIT_TOKENS`, `CLAUDE_WEEKLY_LIMIT_TOKENS` | empty | The same limits in tokens (used when the metric is `tokens`). |
+| `CLAUDE_STATE_DIR` | `$HOME/.claude/usage-dashboard` | Host directory with the status line capture, mounted read-only (compose only). |
+| `USAGE_DASHBOARD_STATE_FILE` | `$HOME/.claude/usage-dashboard/rate-limits.json` | Capture file written by the status line and read by the dashboard. Compose sets it to the mounted path inside the container. |
+| `CLAUDE_STATUSLINE_MAX_AGE_SECONDS` | `900` | Age after which a capture is labelled **stale** (still shown, as a lower bound, until its window resets). Positive integer. |
 | `CLAUDE_WEEKLY_RESET` | `rolling` | `rolling` (trailing 7 days) or a weekly reset like `mon 00:00` / `thursday 17:30`, in `DASHBOARD_TIME_ZONE`. |
 
 Model prices live in `config/pricing.json`, in USD per million tokens. The file is mounted into the container and re-read on every refresh, so you can edit it without rebuilding.
@@ -87,9 +97,22 @@ The combined breakdown shows spend per day stacked by provider (each legend entr
   - Agent names come from the directory name: `…-openclaw-workspace-droid` → `droid`.
 - **Performance:** each file's parse result is cached and keyed by `mtime:size`, so a refresh only re-reads changed files. A cold scan of about 140 MB takes about 0.6 s in the container; an incremental refresh takes about 50 ms.
 
+### Claude: official /usage (status line)
+
+Claude Code passes its [status line command](https://code.claude.com/docs/en/statusline) a JSON blob whose `rate_limits` object holds the numbers `/usage` shows: `five_hour` and `seven_day`, each with `used_percentage` (0–100) and `resets_at` (Unix seconds), plus `spend_limit` behind a Claude apps gateway. `scripts/claude-statusline.mjs` is such a command: it saves `rate_limits` and prints a compact line like `Opus 5.5 · 5h 34% (resets 13:00) · wk 41% (Fri 19:00)`.
+
+- **Install:** `node scripts/install-statusline.mjs` adds `statusLine` to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json`), keeping every other key, after copying the file to `~/backups/settings-claude-<timestamp>.json`. `--dry-run` shows the key diff only; `--uninstall` removes it. An existing, different status line is left alone unless you pass `--force`: then it is kept in the backup and in `statusline-chain.json` next to the capture, the script runs it with the same stdin and prints *its* output (so your status line looks unchanged), and `--uninstall` restores it. `USAGE_DASHBOARD_STATUSLINE_CHAIN=<command>` in Claude Code's environment does the same by hand. The command uses absolute paths to the current `node` and the script, since Claude Code's shell may not have nvm on `PATH`; re-run the installer after changing Node versions or moving the repo.
+- **What is stored:** `~/.claude/usage-dashboard/rate-limits.json` = `{ capturedAt, sessionId, model { id, displayName }, rate_limits }`, written atomically (temp file + rename, mode 0600). Every window key under `rate_limits` is copied generically (only scalar fields), so a future per-model window shows up without a code change; the docs currently list only `five_hour`, `seven_day` and `spend_limit`. Nothing else from stdin (transcript path, cwd, workspace, cost) is written. An update without `rate_limits` never overwrites an earlier capture.
+- **When it refreshes:** only while an **interactive** Claude Code session is running and receiving responses (`rate_limits` appears after a session's first API response, for Pro/Max/Ultra plans). `claude -p` runs, including OpenClaw's claude-cli agent runs, do not run the status line, although they use the same quota. So a capture can lag real usage; it never runs ahead of it.
+- **Dashboard rule, per window:** if the capture has the window and its `resets_at` is in the future, the tile shows the official % with an **official** badge, the reset time and the capture age (source "Claude Code /usage (status line, captured 4 min ago)"). After `CLAUDE_STATUSLINE_MAX_AGE_SECONDS` the badge becomes **official · stale** and the text "as of <time>, at least this much". The capture is *not* discarded for the estimate when stale: usage within a window only grows, so an old reading before `resets_at` is still a true lower bound, which is more than the estimate can claim. Once `resets_at` passes, or when a window is missing or the file is absent/invalid, that window falls back to the estimate (below).
+- **Blocked until:** when Claude Code hits a usage limit it writes a 429 line to the transcript (`apiError: "usage_limit_reached"`, `apiErrorParams.rate_limit_info { status: "rejected", resetsAt, rateLimitType }`). The newest such rejection whose `resetsAt` is still ahead, with no successful API response after it, shows as "Rate-limited (five hour limit): blocked until …" on the tile and as a warning. This works without the status line.
+- **Performance:** the script does no network and one small sync write; a run takes about 3 ms more than Node's own startup (median 78 ms vs 74 ms for `node -e 0` on an M-series Mac with Node 26), well inside Claude Code's 300 ms update debounce. It never throws and always exits 0 with a line, even on garbage stdin or an unwritable state path.
+- **Docker:** compose mounts the *directory* `CLAUDE_STATE_DIR` read-only at `/data/claude-state`. A single-file bind mount would not see the atomic rename. Create the directory before the first `docker compose up` (the installer does), or Docker creates it for you.
+- **API:** each window in `claude.quota` gains `source` (`official` or `estimate`), `sourceLabel` and `official { usedPercent, resetsAt, capturedAt, ageSeconds, stale }` (or `null`); the v0.3 estimate fields stay as they were. `quota.official` describes the capture (`status: ok|missing|invalid`, `capturedAt`, `ageSeconds`, `stale`, `expiredWindows`), `quota.extraWindows` lists other windows (e.g. `spend_limit`), and `quota.block` is `{ until, since, rateLimitType }` or `null`. `quota.estimate` is now true only while some window still shows an estimate.
+
 ### Claude: plan limits (estimate)
 
-Claude subscriptions have a rolling **5-hour session limit** and a **weekly limit**, but Anthropic publishes no token or dollar figures for them. The dashboard therefore only *estimates* usage against limits you supply, and labels every figure "estimate".
+Claude subscriptions have a rolling **5-hour session limit** and a **weekly limit**, but Anthropic publishes no token or dollar figures for them. For any window without an unexpired [status line capture](#claude-official-usage-status-line), the dashboard *estimates* usage against limits you supply and labels it "estimate".
 
 - **What is measured:** the same deduplicated transcript records as the cost figures. `CLAUDE_QUOTA_METRIC=usd` (the default) sums API-equivalent cost; `tokens` sums all tokens. USD is the default because cache reads dominate raw token counts while costing a tenth of the input rate, so a token limit swings with cache behaviour. Unpriced models count tokens but no USD.
 - **Session window:** a window opens at the first message after the previous window expired and lasts 5 hours; the start is floored to the hour, matching the on-the-hour reset times Claude shows. It is a block, not a trailing 5 hours: steady use from 10:10 to 16:00 is two windows (10:00–15:00 and 15:00–20:00). When the latest window has expired, the session shows 0 and "the next message starts one". The tile shows the reset time.
@@ -201,7 +224,8 @@ HEAD is answered wherever GET is (same status and headers, no body), as for the 
 - Attribution by cutover time is only as accurate as `WEB_SEARCH_PROVIDER_HISTORY`. It applies only to calls whose result records no provider.
 - The active-provider badge comes from `WEB_SEARCH_PROVIDER`, not from OpenClaw's live config, so it can drift if one is changed without the other. When unset, it is only as current as the last recorded search.
 - Windows roll over at midnight on the next API read; an open page re-fetches every `AUTO_REFRESH_SECONDS` (not at all when it is `0`). Month-to-date figures (e.g. "Searches 2026-11") and the Claude plan-limit estimate are fixed at refresh time.
-- Claude plan limits are estimates against limits you calibrate yourself. The window rules (block start floored to the hour, 5-hour length) follow Claude's described behaviour and its on-the-hour reset times, not a published algorithm; Anthropic can change them.
+- Official Claude percentages are only as fresh as the last interactive Claude Code session (see [above](#claude-official-usage-status-line)); with several sessions open the last one to update wins, which is fine because they share one account. `capturedAt` is when the status line last ran, which can be slightly later than the API response that produced the numbers.
+- Claude plan-limit estimates are against limits you calibrate yourself. The window rules (block start floored to the hour, 5-hour length) follow Claude's described behaviour and its on-the-hour reset times, not a published algorithm; Anthropic can change them.
 - There is no authentication. Keep `BIND_ADDRESS=127.0.0.1` or put the dashboard behind a reverse proxy that handles auth.
 
 ## License

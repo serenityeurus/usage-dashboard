@@ -79,3 +79,7 @@ button.secondary { background: transparent; border: 1px solid var(--border); col
 .quota-row.over strong { color: var(--error); }
 .quota-reset { margin-top: 2px; }
 .badge-estimate { background: #5a4a1a; color: #ffe7a3; }
+.badge-official { background: #1f4f6f; color: #d8efff; }
+.badge-stale { background: #3a4452; color: #c9d3df; }
+.quota-fill.stale { opacity: 0.55; }
+.quota-blocked { margin: 0; font-size: 13px; }

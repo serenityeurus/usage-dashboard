@@ -12,6 +12,8 @@ services:
       LISTEN_HOST: 0.0.0.0
       CLAUDE_PROJECTS_DIR: /data/claude-projects
       PRICING_FILE: /app/config/pricing.json
+      # Claude Code /usage capture written by scripts/claude-statusline.mjs.
+      USAGE_DASHBOARD_STATE_FILE: /data/claude-state/rate-limits.json
       # The browser's Host header carries the host-side port; the Host allowlist needs it.
       HOST_PORT: "${HOST_PORT:-8787}"
       # SearXNG runs on the host; host.docker.internal reaches it from the container.
@@ -23,6 +25,10 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8787}:8787"
     volumes:
       - "${CLAUDE_PROJECTS_DIR:-${HOME}/.claude/projects}:/data/claude-projects:ro"
+      # The directory, not the file: the status line replaces the file by
+      # rename, which a single-file bind mount would not see. Create it first
+      # (the installer does) so Docker does not create it root-owned.
+      - "${CLAUDE_STATE_DIR:-${HOME}/.claude/usage-dashboard}:/data/claude-state:ro"
       # Pricing is mounted so edits apply on the next Refresh without a rebuild.
       - ./config/pricing.json:/app/config/pricing.json:ro
     read_only: true

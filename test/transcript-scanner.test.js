@@ -11,7 +11,7 @@ const FixtureRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fix
 describe('parseTranscriptText', () => {
   it('returns nothing for empty input', () => {
     const parsed = parseTranscriptText('', { projectDir: 'p', sessionFile: '/x/s.jsonl' });
-    assert.deepEqual(parsed, { usageRecords: [], webSearchCalls: [], malformedLineCount: 0 });
+    assert.deepEqual(parsed, { usageRecords: [], webSearchCalls: [], rateLimitEvents: [], malformedLineCount: 0 });
   });
 
   it('dedupes streaming duplicate lines that share a message id', async () => {
