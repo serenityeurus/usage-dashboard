@@ -70,3 +70,12 @@ table.windows tr.sub td { color: var(--muted); }
 .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
 button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); padding: 4px 10px; font-weight: 500; margin-left: 8px; }
 .ok { color: #6fdc8c; }
+.quota { border-top: 1px solid var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.quota-title { font-size: 13px; font-weight: 600; }
+.quota-head { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.quota-track { height: 8px; background: #252b34; border-radius: 999px; overflow: hidden; margin-top: 4px; }
+.quota-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+.quota-row.over .quota-fill { background: var(--error); }
+.quota-row.over strong { color: var(--error); }
+.quota-reset { margin-top: 2px; }
+.badge-estimate { background: #5a4a1a; color: #ffe7a3; }

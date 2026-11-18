@@ -3,6 +3,14 @@ const appRoot = document.getElementById('app');
 const refreshButton = document.getElementById('refresh-button');
 const refreshedAtLabel = document.getElementById('refreshed-at');
 const todayLabel = document.getElementById('today-label');
+const autoRefreshLabel = document.getElementById('auto-refresh-label');
+
+// Server-reported auto-refresh interval (AUTO_REFRESH_SECONDS); null until the
+// first payload, 0 when disabled. The page re-fetches on the same interval.
+let autoRefreshSeconds = null;
+let lastRefreshedAt = null;
+let dashboardTimeZone;
+let pollTimer = null;
 
 const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const integerFormatter = new Intl.NumberFormat('en-US');
@@ -41,6 +49,26 @@ function setRefreshedAt(refreshedAt, durationMs) {
   refreshedAtLabel.textContent = refreshedAt
     ? `Updated ${formatDateTime(refreshedAt)}${durationMs != null ? ` (${durationMs} ms)` : ''}`
     : 'Collecting data…';
+}
+
+function formatInterval(seconds) {
+  return seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} s`;
+}
+
+// Every API payload carries refreshedAt, timeZone and autoRefreshSeconds.
+function noteServerState(payload) {
+  lastRefreshedAt = payload.refreshedAt || null;
+  dashboardTimeZone = payload.timeZone || undefined;
+  if (typeof payload.autoRefreshSeconds === 'number') autoRefreshSeconds = payload.autoRefreshSeconds;
+  autoRefreshLabel.textContent = autoRefreshSeconds ? `· auto-refresh every ${formatInterval(autoRefreshSeconds)}` : (autoRefreshSeconds === 0 ? '· auto-refresh off' : '');
+}
+
+// Reset times are shown in the dashboard time zone, like the day windows.
+function formatResetTime(isoString) {
+  if (!isoString) return '—';
+  return new Date(isoString).toLocaleString('en-US', {
+    timeZone: dashboardTimeZone, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
 }
 
 // ---------- time windows (normalized by the server for every provider) ----------
@@ -107,8 +135,56 @@ function renderTotalTile(total) {
     </a>`;
 }
 
+// ---------- Claude plan-limit estimate ----------
+function formatQuotaAmount(metric, value) {
+  return metric === 'usd' ? formatUsd(value) : formatCompact(value);
+}
+
+function quotaBar(label, window, metric, resetText) {
+  const used = window.used?.[metric];
+  if (window.limit == null) {
+    return `<div class="quota-row"><div class="quota-head"><span>${escapeHtml(label)}</span><span class="muted">${formatQuotaAmount(metric, used)} used · no limit set</span></div>
+      <div class="quota-reset muted small">${escapeHtml(resetText)}</div></div>`;
+  }
+  const width = Math.min(100, Math.max(0, window.percent));
+  return `<div class="quota-row${window.overLimit ? ' over' : ''}">
+      <div class="quota-head"><span>${escapeHtml(label)}</span><span><strong>${window.overLimit ? '>100% ' : ''}${window.percent.toFixed(1)}%</strong>
+        <span class="muted">${formatQuotaAmount(metric, used)} / ${formatQuotaAmount(metric, window.limit)}</span></span></div>
+      <div class="quota-track" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${width}"><div class="quota-fill" style="width:${width}%"></div></div>
+      <div class="quota-reset muted small">${escapeHtml(resetText)}${window.overLimit ? ' · over the configured limit: recalibrate?' : ''}</div>
+    </div>`;
+}
+
+function sessionResetText(session) {
+  if (!session.active) return `No active ${session.windowHours}-hour window; the next message starts one`;
+  if (Date.parse(session.resetAt) <= Date.now()) return 'Window ended; updates on the next refresh';
+  return `Resets ${formatResetTime(session.resetAt)} (window opened ${formatResetTime(session.startAt)})`;
+}
+
+function weeklyResetText(weekly) {
+  if (weekly.mode === 'fixed') return `Resets ${formatResetTime(weekly.resetAt)} (weekly, ${weekly.label})`;
+  return `Rolling 7 days${weekly.nextDropAt ? `; oldest counted usage ages out ${formatResetTime(weekly.nextDropAt)}` : ''}`;
+}
+
+function renderQuota(quota) {
+  if (!quota) return '';
+  const metricLabel = quota.metric === 'usd' ? 'API-equivalent USD' : 'tokens';
+  const heading = `<div class="quota-title">Plan limits <span class="badge badge-estimate" title="${escapeHtml(quota.calibrationNote)}">estimate</span> <span class="muted small">by ${metricLabel}</span></div>`;
+  if (!quota.configured) {
+    return `<div class="quota">${heading}
+      <p class="muted small">Not configured. ${escapeHtml(quota.howToConfigure)}</p>
+      <p class="muted small">Now: ${formatQuotaAmount(quota.metric, quota.session.used[quota.metric])} in the current 5-hour window, ${formatQuotaAmount(quota.metric, quota.weekly.used[quota.metric])} this week (${escapeHtml(quota.weekly.label)}).</p></div>`;
+  }
+  return `<div class="quota">${heading}
+      ${quotaBar(`Session (${quota.session.windowHours} h)`, quota.session, quota.metric, sessionResetText(quota.session))}
+      ${quotaBar('Weekly', quota.weekly, quota.metric, weeklyResetText(quota.weekly))}
+      <p class="muted small">Calibrate against Claude Code's /usage and adjust the limits.</p>
+    </div>`;
+}
+
 // ---------- tiles ----------
 function renderTiles(summary) {
+  noteServerState(summary);
   setRefreshedAt(summary.refreshedAt, summary.durationMs);
   setToday(summary.range, summary.timeZone);
   if (!summary.providers.length) {
@@ -125,6 +201,7 @@ function renderTiles(summary) {
         ${provider.primaryMetric ? `<div><span class="big">${formatCompact(provider.primaryMetric.value)}</span><span class="label">${escapeHtml(provider.primaryMetric.label)}</span></div>` : ''}
       </div>
       ${windowsTable(provider.windows, { costKind: provider.costKind })}
+      ${provider.id === 'claude' ? renderQuota(provider.quota) : ''}
       <dl class="tile-secondary">${(provider.secondaryMetrics || []).map((metric) => `
         <div><dt>${escapeHtml(metric.label)}</dt><dd>${formatMetric(metric)}</dd></div>`).join('')}
       </dl>
@@ -248,6 +325,20 @@ function renderClaudeDetail(detail) {
   }
 
   const tokenTypeRows = Object.entries(detail.tokenTypes).map(([tokenType, row]) => ({ tokenType, ...row }));
+  const quota = detail.quota;
+  const quotaSection = quota ? `
+    <h3>Plan limits (estimate)</h3>
+    <p class="note">${escapeHtml(quota.calibrationNote)} Session windows open at the first message after the previous
+      ${quota.session.windowHours}-hour window expired (start floored to the hour) and last ${quota.session.windowHours} hours.</p>
+    ${renderQuota(quota)}
+    <h3>Recent session windows</h3>
+    ${dataTable([
+    { label: 'Window', render: (row) => `${escapeHtml(formatResetTime(row.startAt))} → ${escapeHtml(formatResetTime(row.resetAt))}${row.active ? ' <span class="badge">current</span>' : ''}` },
+    { label: 'Messages', numeric: true, render: (row) => formatInteger(row.used.messages) },
+    { label: 'Tokens', numeric: true, render: (row) => formatCompact(row.used.tokens) },
+    { label: 'API-equiv. cost', numeric: true, render: (row) => formatUsd(row.used.usd) + (row.used.unpricedMessages ? ' *' : '') },
+    { label: 'Of session limit', numeric: true, render: (row) => (row.percent == null ? '—' : `${row.percent.toFixed(1)}%`) },
+  ], quota.recentBlocks || [])}` : '';
   return `
     <p class="note"><strong>${escapeHtml(detail.costLabel)}.</strong> ${escapeHtml(detail.costNote)}</p>
     ${statCards([
@@ -258,6 +349,7 @@ function renderClaudeDetail(detail) {
       { label: 'Sessions', value: formatInteger(detail.sessionCount) },
     ])}
     ${detail.unknownModels.length ? `<p class="warning">* Models missing from config/pricing.json (cost excluded): ${detail.unknownModels.map((row) => `${escapeHtml(row.model)} (${row.messageCount})`).join(', ')}</p>` : ''}
+    ${quotaSection}
     <h3>By day</h3>
     ${barChart(detail.byDay, { valueKey: 'costUsd', format: formatUsd, title: 'API-equivalent cost per day' })}
     ${barChart(detail.byDay, { valueKey: 'totalTokens', format: formatCompact, title: 'Tokens per day' })}
@@ -387,6 +479,7 @@ function renderSearxngDetail(detail) {
 
 async function renderTotalDetail() {
   const payload = await fetchJson('/api/total');
+  noteServerState(payload);
   setRefreshedAt(payload.refreshedAt);
   setToday(payload.range, payload.timeZone);
   if (!payload.summary) {
@@ -456,6 +549,7 @@ function renderGenericDetail(detail) {
 
 async function renderDetail(providerId) {
   const payload = await fetchJson(`/api/providers/${encodeURIComponent(providerId)}`);
+  noteServerState(payload);
   setRefreshedAt(payload.refreshedAt);
   setToday(payload.range, payload.timeZone);
   const renderer = DetailRenderers[providerId] || renderGenericDetail;
@@ -468,16 +562,52 @@ async function renderDetail(providerId) {
 }
 
 // ---------- routing & refresh ----------
-async function route() {
+// background: a timer re-fetch. A failed background fetch keeps the current
+// view (the server may be restarting) and only notes the error in the header.
+async function route({ background = false } = {}) {
   const providerMatch = location.hash.match(/^#\/provider\/([a-z0-9-]+)$/);
+  const scrollY = window.scrollY;
   try {
     if (location.hash === '#/total') await renderTotalDetail();
     else if (providerMatch) await renderDetail(providerMatch[1]);
     else renderTiles(await fetchJson('/api/summary'));
+    if (background) window.scrollTo(0, scrollY); // re-render must not jump the page
   } catch (error) {
-    appRoot.innerHTML = `<p class="error">Failed to load: ${escapeHtml(error.message)}</p>`;
+    if (background) refreshedAtLabel.textContent = `Auto-refresh failed (${error.message}); retrying`;
+    else appRoot.innerHTML = `<p class="error">Failed to load: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    schedulePoll();
   }
 }
+
+// Re-fetch (GET only; the server's own timer does the refresh) once per
+// interval, aimed just after the server's next expected auto refresh so the
+// tab lags the server by seconds, not a whole interval. Paused while hidden.
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  if (!autoRefreshSeconds || document.hidden) return;
+  const intervalMs = autoRefreshSeconds * 1000;
+  let delayMs = intervalMs;
+  const refreshedAtMs = Date.parse(lastRefreshedAt);
+  if (Number.isFinite(refreshedAtMs)) {
+    const untilNextServerRefreshMs = refreshedAtMs + intervalMs + 5000 - Date.now();
+    if (untilNextServerRefreshMs >= 5000 && untilNextServerRefreshMs < intervalMs) delayMs = untilNextServerRefreshMs;
+  }
+  pollTimer = setTimeout(() => {
+    if (refreshButton.disabled) schedulePoll(); // a manual refresh is in progress and will re-render
+    else route({ background: true });
+  }, delayMs);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  } else {
+    route({ background: true }); // catch up at once, then resume the schedule
+  }
+});
 
 refreshButton.addEventListener('click', async () => {
   refreshButton.disabled = true;

@@ -5,7 +5,8 @@
 //   context.getTranscripts() -> memoized transcript scan shared by all
 //     providers within one refresh (each file is read at most once).
 //   context.now    -> Date of this refresh
-//   context.reason -> 'startup' | 'refresh'
+//   context.reason -> 'startup' | 'refresh' | 'auto' (AUTO_REFRESH_SECONDS timer;
+//     adapters must not spend money on 'auto', see decideQuotaProbe)
 //   context.probes -> Set of explicitly requested paid probes (e.g. 'brave')
 // summary: { id, name, costUsd, costLabel, costKind ('actual'|'api-equivalent'|'estimated'),
 //            active?, activeProvider?{id,source,at}, hidden? (omit the tile, keep it in the total),
@@ -92,15 +93,18 @@ export function createDashboardState({ providers, transcriptScanner, clock = () 
     // Concurrent refresh requests share one in-flight run instead of stacking.
     // A request that asks for probes the in-flight run lacks waits for it, then
     // starts its own run, so an explicit probe request is never silently dropped.
+    // Likewise a startup/manual request never joins an 'auto' run: auto runs
+    // skip work (the Brave probe) that a manual Refresh may perform.
     async refresh(reason = 'refresh', { probes = [] } = {}) {
       const requestedProbes = new Set(probes);
       while (refreshInFlight) {
         const inFlight = refreshInFlight;
-        if ([...requestedProbes].every((probe) => inFlight.probes.has(probe))) return inFlight.promise;
+        const coversReason = inFlight.reason !== 'auto' || reason === 'auto';
+        if (coversReason && [...requestedProbes].every((probe) => inFlight.probes.has(probe))) return inFlight.promise;
         await inFlight.promise.catch(() => null);
       }
       const promise = runRefresh(reason, requestedProbes).finally(() => { refreshInFlight = null; });
-      refreshInFlight = { promise, probes: requestedProbes };
+      refreshInFlight = { promise, probes: requestedProbes, reason };
       return promise;
     },
     getSnapshot: currentView,

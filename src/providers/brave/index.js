@@ -11,7 +11,11 @@ import { createQuotaProbe } from './quota.js';
 //                              active one is only inferred) only when explicitly
 //                              requested (POST /api/refresh?probe=brave, the
 //                              "Probe quota" button)
+// Timer-driven refreshes (reason 'auto', AUTO_REFRESH_SECONDS) never probe,
+// whatever the mode: at the 300 s default, BRAVE_QUOTA_PROBE=true would
+// otherwise spend ~288 paid queries a day on an idle dashboard.
 export function decideQuotaProbe({ mode, active, activeSource = 'configured', probeOnStartup, reason, explicitlyRequested }) {
+  if (reason === 'auto') return { probe: false, why: 'auto refreshes never probe; press Refresh or Probe quota' };
   if (mode === 'false') return { probe: false, why: 'disabled by BRAVE_QUOTA_PROBE=false' };
   if (explicitlyRequested) return { probe: true, why: 'explicitly requested' };
   if (mode === 'auto' && activeSource !== 'configured') {

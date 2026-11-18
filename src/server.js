@@ -24,7 +24,10 @@ environment variables (see usage-dashboard.example.env):
   WEB_SEARCH_PROVIDER, WEB_SEARCH_PROVIDER_HISTORY,
   BRAVE_API_KEY, BRAVE_COST_PER_1K, BRAVE_MONTHLY_CREDIT_USD,
   BRAVE_QUOTA_MIN_INTERVAL_SECONDS, BRAVE_QUOTA_PROBE, BRAVE_PROBE_ON_STARTUP,
-  SEARXNG_BASE_URL, SEARXNG_TIMEOUT_SECONDS
+  SEARXNG_BASE_URL, SEARXNG_TIMEOUT_SECONDS,
+  AUTO_REFRESH_SECONDS (default 300, 0 disables; auto refreshes never probe Brave),
+  CLAUDE_QUOTA_METRIC, CLAUDE_SESSION_LIMIT_USD, CLAUDE_WEEKLY_LIMIT_USD,
+  CLAUDE_SESSION_LIMIT_TOKENS, CLAUDE_WEEKLY_LIMIT_TOKENS, CLAUDE_WEEKLY_RESET
 
 Endpoints:
   GET  /healthz                 liveness + last refresh time
@@ -57,9 +60,10 @@ function sendJson(response, statusCode, body) {
   response.end(payload);
 }
 
-function summaryView(snapshot) {
+function summaryView(snapshot, autoRefreshSeconds) {
   return {
     refreshedAt: snapshot.refreshedAt,
+    autoRefreshSeconds,
     refreshReason: snapshot.refreshReason,
     durationMs: snapshot.durationMs,
     timeZone: snapshot.timeZone,
@@ -103,7 +107,36 @@ async function serveStatic(publicDir, urlPath, response) {
   }
 }
 
-export function createRequestHandler({ dashboardState, publicDir, hostPolicy = createHostPolicy(), startedAt = new Date() }) {
+// Runs dashboardState.refresh('auto') every intervalSeconds. A tick that finds
+// a refresh already running (startup, a manual Refresh, a slow previous tick)
+// is skipped rather than queued, so ticks never pile up behind a slow scan.
+// The timer is unref'd: it never keeps the process alive on its own.
+export function startAutoRefresh({
+  dashboardState, intervalSeconds, logger = console, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval,
+}) {
+  if (!intervalSeconds) return { stop() {}, tick: async () => 'disabled' };
+  async function tick() {
+    if (dashboardState.isRefreshing()) {
+      logger.log('auto refresh skipped: a refresh is already in flight');
+      return 'skipped';
+    }
+    try {
+      const snapshot = await dashboardState.refresh('auto');
+      logger.log(`auto refresh done in ${snapshot.durationMs}ms`);
+      return 'ran';
+    } catch (error) {
+      logger.error('auto refresh failed', error);
+      return 'failed';
+    }
+  }
+  const timer = setIntervalImpl(tick, intervalSeconds * 1000);
+  timer?.unref?.();
+  return { stop: () => clearIntervalImpl(timer), tick };
+}
+
+export function createRequestHandler({
+  dashboardState, publicDir, hostPolicy = createHostPolicy(), startedAt = new Date(), autoRefreshSeconds = 0,
+}) {
   return async (request, response) => {
     const rejection = checkRequest(request, hostPolicy);
     if (rejection) {
@@ -136,21 +169,21 @@ export function createRequestHandler({ dashboardState, publicDir, hostPolicy = c
       }
       if (url.pathname === '/api/summary') {
         if (!isRead) return methodNotAllowed('GET, HEAD');
-        sendJson(response, 200, summaryView(dashboardState.getSnapshot()));
+        sendJson(response, 200, summaryView(dashboardState.getSnapshot(), autoRefreshSeconds));
         return;
       }
       if (url.pathname === '/api/refresh') {
         if (request.method !== 'POST') return methodNotAllowed('POST');
         const probes = url.searchParams.getAll('probe').flatMap((value) => value.split(',')).filter(Boolean);
         const snapshot = await dashboardState.refresh('refresh', { probes });
-        sendJson(response, 200, summaryView(snapshot));
+        sendJson(response, 200, summaryView(snapshot, autoRefreshSeconds));
         return;
       }
       if (url.pathname === '/api/total') {
         if (!isRead) return methodNotAllowed('GET, HEAD');
         const snapshot = dashboardState.getSnapshot();
         sendJson(response, 200, {
-          refreshedAt: snapshot.refreshedAt, timeZone: snapshot.timeZone, range: snapshot.range, summary: snapshot.total?.summary ?? null, detail: snapshot.total?.detail ?? null,
+          refreshedAt: snapshot.refreshedAt, autoRefreshSeconds, timeZone: snapshot.timeZone, range: snapshot.range, summary: snapshot.total?.summary ?? null, detail: snapshot.total?.detail ?? null,
         });
         return;
       }
@@ -164,7 +197,7 @@ export function createRequestHandler({ dashboardState, publicDir, hostPolicy = c
           return;
         }
         sendJson(response, 200, {
-          refreshedAt: snapshot.refreshedAt, timeZone: snapshot.timeZone, range: snapshot.range, ok: entry.ok, error: entry.error, summary: entry.summary, detail: entry.detail,
+          refreshedAt: snapshot.refreshedAt, autoRefreshSeconds, timeZone: snapshot.timeZone, range: snapshot.range, ok: entry.ok, error: entry.error, summary: entry.summary, detail: entry.detail,
         });
         return;
       }
@@ -195,7 +228,7 @@ async function main() {
   const attributionOptions = { history: config.webSearchProviderHistory, fallbackProvider: 'brave' };
   const providers = [
     createClaudeProvider({
-      pricingFilePath: config.pricingFilePath, adminKey: config.anthropicAdminKey, timeZone: config.timeZone,
+      pricingFilePath: config.pricingFilePath, adminKey: config.anthropicAdminKey, timeZone: config.timeZone, quotaConfig: config.claudeQuota,
     }),
     createBraveProvider({
       apiKey: config.braveApiKey,
@@ -219,19 +252,25 @@ async function main() {
   ];
   const dashboardState = createDashboardState({ providers, transcriptScanner, timeZone: config.timeZone });
   const hostPolicy = createHostPolicy({ extraHosts: config.allowedHosts, ports: [config.port, config.hostPort] });
-  const server = http.createServer(createRequestHandler({ dashboardState, publicDir: config.publicDir, hostPolicy }));
+  const server = http.createServer(createRequestHandler({
+    dashboardState, publicDir: config.publicDir, hostPolicy, autoRefreshSeconds: config.autoRefreshSeconds,
+  }));
 
   server.listen(config.port, config.listenHost, () => {
     console.log(`usage-dashboard listening on http://${config.listenHost}:${config.port} (tz ${config.timeZone}, `
-      + `web_search provider ${config.webSearchProvider ?? 'unset (inferred from transcripts, no auto Brave probe)'}, allowed hosts ${JSON.stringify(hostPolicy.describe())})`);
+      + `web_search provider ${config.webSearchProvider ?? 'unset (inferred from transcripts, no auto Brave probe)'}, allowed hosts ${JSON.stringify(hostPolicy.describe())}, `
+      + `auto refresh ${config.autoRefreshSeconds ? `every ${config.autoRefreshSeconds}s (never probes Brave)` : 'disabled'})`);
   });
   const snapshot = await dashboardState.refresh('startup');
   const scanStats = snapshot.providers.claude?.detail?.scan;
   console.log(`initial refresh done in ${snapshot.durationMs}ms`, scanStats
     ? `(${scanStats.fileCount} transcript files, ${(scanStats.totalBytes / 1e6).toFixed(1)} MB)` : '');
+  // Started after the startup refresh so the first tick is a full interval later.
+  const autoRefresh = startAutoRefresh({ dashboardState, intervalSeconds: config.autoRefreshSeconds });
 
   const shutdown = (signal) => {
     console.log(`${signal} received, shutting down`);
+    autoRefresh.stop();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000).unref();
   };
