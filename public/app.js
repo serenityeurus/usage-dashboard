@@ -140,15 +140,15 @@ function formatQuotaAmount(metric, value) {
   return metric === 'usd' ? formatUsd(value) : formatCompact(value);
 }
 
-function quotaBar(label, window, metric, resetText) {
+function quotaBar(label, window, metric, resetText, badgeHtml = '') {
   const used = window.used?.[metric];
   if (window.limit == null) {
-    return `<div class="quota-row"><div class="quota-head"><span>${escapeHtml(label)}</span><span class="muted">${formatQuotaAmount(metric, used)} used · no limit set</span></div>
+    return `<div class="quota-row"><div class="quota-head"><span>${escapeHtml(label)} ${badgeHtml}</span><span class="muted">${formatQuotaAmount(metric, used)} used · no limit set</span></div>
       <div class="quota-reset muted small">${escapeHtml(resetText)}</div></div>`;
   }
   const width = Math.min(100, Math.max(0, window.percent));
   return `<div class="quota-row${window.overLimit ? ' over' : ''}">
-      <div class="quota-head"><span>${escapeHtml(label)}</span><span><strong>${window.overLimit ? '>100% ' : ''}${window.percent.toFixed(1)}%</strong>
+      <div class="quota-head"><span>${escapeHtml(label)} ${badgeHtml}</span><span><strong>${window.overLimit ? '>100% ' : ''}${window.percent.toFixed(1)}%</strong>
         <span class="muted">${formatQuotaAmount(metric, used)} / ${formatQuotaAmount(metric, window.limit)}</span></span></div>
       <div class="quota-track" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${width}"><div class="quota-fill" style="width:${width}%"></div></div>
       <div class="quota-reset muted small">${escapeHtml(resetText)}${window.overLimit ? ' · over the configured limit: recalibrate?' : ''}</div>
@@ -166,19 +166,66 @@ function weeklyResetText(weekly) {
   return `Rolling 7 days${weekly.nextDropAt ? `; oldest counted usage ages out ${formatResetTime(weekly.nextDropAt)}` : ''}`;
 }
 
+// Captured age, recomputed client-side so it keeps ticking between refreshes.
+function formatAge(isoString) {
+  const seconds = Math.max(0, (Date.now() - Date.parse(isoString)) / 1000);
+  if (seconds < 90) return `${Math.round(seconds)} s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min`;
+  if (seconds < 172800) return `${Math.round(seconds / 3600)} h`;
+  return `${Math.round(seconds / 86400)} d`;
+}
+
+function sourceBadge(window) {
+  if (window.source !== 'official') return `<span class="badge badge-estimate" title="${escapeHtml(window.sourceLabel || '')}">estimate</span>`;
+  const stale = window.official.stale;
+  return `<span class="badge ${stale ? 'badge-stale' : 'badge-official'}" title="${escapeHtml(window.sourceLabel)}">official${stale ? ' · stale' : ''}</span>`;
+}
+
+// Official /usage percentage from the status line capture.
+function officialBar(label, official) {
+  const width = Math.min(100, Math.max(0, official.usedPercent));
+  const captured = official.stale
+    ? `as of ${formatResetTime(official.capturedAt)} (${formatAge(official.capturedAt)} ago), at least this much`
+    : `captured ${formatAge(official.capturedAt)} ago`;
+  const spend = official.usedUsd != null && official.limitUsd != null ? ` · ${formatUsd(official.usedUsd)} / ${formatUsd(official.limitUsd)}` : '';
+  return `<div class="quota-row${official.usedPercent >= 100 ? ' over' : ''}">
+      <div class="quota-head"><span>${escapeHtml(label)} ${sourceBadge({ source: 'official', official, sourceLabel: official.sourceLabel })}</span><span><strong>${official.usedPercent.toFixed(official.usedPercent % 1 ? 1 : 0)}%</strong><span class="muted">${spend}</span></span></div>
+      <div class="quota-track" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${width}"><div class="quota-fill${official.stale ? ' stale' : ''}" style="width:${width}%"></div></div>
+      <div class="quota-reset muted small">${official.resetsAt ? `Resets ${escapeHtml(formatResetTime(official.resetsAt))} · ` : ''}Claude Code /usage, ${escapeHtml(captured)}</div>
+    </div>`;
+}
+
+function quotaWindow(label, window, quota, resetText) {
+  if (window.source === 'official') return officialBar(label, window.official);
+  return quotaBar(label, window, quota.metric, resetText, sourceBadge(window));
+}
+
+const ExtraWindowLabels = { spend_limit: 'Spend limit' };
+
+function renderBlock(block) {
+  if (!block) return '';
+  const kind = block.rateLimitType ? ` (${block.rateLimitType.replace(/_/g, ' ')} limit)` : '';
+  return `<p class="error quota-blocked">Rate-limited${escapeHtml(kind)}: blocked until ${escapeHtml(formatResetTime(block.until))}</p>`;
+}
+
 function renderQuota(quota) {
   if (!quota) return '';
+  const anyEstimate = quota.session.source !== 'official' || quota.weekly.source !== 'official';
   const metricLabel = quota.metric === 'usd' ? 'API-equivalent USD' : 'tokens';
-  const heading = `<div class="quota-title">Plan limits <span class="badge badge-estimate" title="${escapeHtml(quota.calibrationNote)}">estimate</span> <span class="muted small">by ${metricLabel}</span></div>`;
-  if (!quota.configured) {
-    return `<div class="quota">${heading}
-      <p class="muted small">Not configured. ${escapeHtml(quota.howToConfigure)}</p>
-      <p class="muted small">Now: ${formatQuotaAmount(quota.metric, quota.session.used[quota.metric])} in the current 5-hour window, ${formatQuotaAmount(quota.metric, quota.weekly.used[quota.metric])} this week (${escapeHtml(quota.weekly.label)}).</p></div>`;
-  }
+  const official = quota.official || {};
+  const heading = `<div class="quota-title">Plan limits${anyEstimate ? ` <span class="muted small">estimates by ${metricLabel}</span>` : ''}</div>`;
+  const captureNote = official.status === 'ok'
+    ? ''
+    : `<p class="muted small">No Claude Code /usage capture yet${official.status === 'invalid' ? ` (state file ${escapeHtml(official.error)})` : ''}: install the status line (node scripts/install-statusline.mjs) and use an interactive Claude Code session.</p>`;
+  const extra = (quota.extraWindows || []).map((window) => officialBar(ExtraWindowLabels[window.key] || window.key.replace(/_/g, ' '), window)).join('');
+  const calibration = anyEstimate && quota.configured ? '<p class="muted small">Estimates: calibrate against Claude Code\'s /usage and adjust the limits.</p>' : '';
+  const unconfigured = anyEstimate && !quota.configured ? `<p class="muted small">Estimate limits not configured. ${escapeHtml(quota.howToConfigure)}</p>` : '';
   return `<div class="quota">${heading}
-      ${quotaBar(`Session (${quota.session.windowHours} h)`, quota.session, quota.metric, sessionResetText(quota.session))}
-      ${quotaBar('Weekly', quota.weekly, quota.metric, weeklyResetText(quota.weekly))}
-      <p class="muted small">Calibrate against Claude Code's /usage and adjust the limits.</p>
+      ${renderBlock(quota.block)}
+      ${quotaWindow(`Session (${quota.session.windowHours} h)`, quota.session, quota, sessionResetText(quota.session))}
+      ${quotaWindow('Weekly', quota.weekly, quota, weeklyResetText(quota.weekly))}
+      ${extra}
+      ${captureNote}${unconfigured}${calibration}
     </div>`;
 }
 
@@ -327,11 +374,14 @@ function renderClaudeDetail(detail) {
   const tokenTypeRows = Object.entries(detail.tokenTypes).map(([tokenType, row]) => ({ tokenType, ...row }));
   const quota = detail.quota;
   const quotaSection = quota ? `
-    <h3>Plan limits (estimate)</h3>
-    <p class="note">${escapeHtml(quota.calibrationNote)} Session windows open at the first message after the previous
+    <h3>Plan limits</h3>
+    <p class="note"><strong>Official</strong> figures are Claude Code's own /usage percentages, saved by the status line
+      (scripts/claude-statusline.mjs) whenever an interactive Claude Code session updates; they do not refresh during
+      <code>claude -p</code> runs, so a capture older than ${escapeHtml(Math.round((quota.official?.maxAgeSeconds || 900) / 60))} min is marked stale and shown as a lower bound until its window resets.
+      <strong>Estimates</strong> fill any window without an unexpired capture. ${escapeHtml(quota.calibrationNote)} Session windows open at the first message after the previous
       ${quota.session.windowHours}-hour window expired (start floored to the hour) and last ${quota.session.windowHours} hours.</p>
     ${renderQuota(quota)}
-    <h3>Recent session windows</h3>
+    <h3>Recent session windows (estimate)</h3>
     ${dataTable([
     { label: 'Window', render: (row) => `${escapeHtml(formatResetTime(row.startAt))} → ${escapeHtml(formatResetTime(row.resetAt))}${row.active ? ' <span class="badge">current</span>' : ''}` },
     { label: 'Messages', numeric: true, render: (row) => formatInteger(row.used.messages) },

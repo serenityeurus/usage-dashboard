@@ -22,6 +22,12 @@
 //   attributed by time later (see web-search-attribution.js). To keep cold
 //   scans fast, tool_result lines are only JSON-parsed when they mention a
 //   still-unmatched web_search tool_use id.
+// - A 429 usage_limit_reached is written as a type "assistant" line (model
+//   "<synthetic>", zero usage) with apiErrorParams.rate_limit_info:
+//   { status: "rejected", resetsAt: <unix s>, rateLimitType: "five_hour"|... }.
+//   We keep those as rateLimitEvents (any line type, in case Claude Code moves
+//   them to system/api_error lines); errors without resetsAt (e.g.
+//   credits_required) are dropped.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -31,6 +37,8 @@ export const WebSearchToolNames = new Set(['mcp__openclaw__web_search', 'web_sea
 export function parseTranscriptText(fileText, { projectDir, sessionFile }) {
   const usageRecords = [];
   const webSearchCalls = [];
+  const rateLimitEvents = [];
+  const seenRateLimitKeys = new Set();
   const seenMessageIds = new Set();
   const seenToolUseIds = new Set();
   const pendingResults = new Map(); // toolUseId -> call awaiting its tool_result
@@ -41,7 +49,8 @@ export function parseTranscriptText(fileText, { projectDir, sessionFile }) {
     if (pendingResults.size && rawLine.includes('"tool_result"')) {
       matchWebSearchResults(rawLine, pendingResults); // no `continue`: assistant text may mention tool_result
     }
-    if (!rawLine.includes('"assistant"')) continue; // cheap pre-filter
+    const mentionsRateLimit = rawLine.includes('"rate_limit_info"');
+    if (!mentionsRateLimit && !rawLine.includes('"assistant"')) continue; // cheap pre-filter
     let entry;
     try {
       entry = JSON.parse(rawLine);
@@ -49,6 +58,7 @@ export function parseTranscriptText(fileText, { projectDir, sessionFile }) {
       malformedLineCount += 1; // partially written last line of a live session
       continue;
     }
+    if (mentionsRateLimit) collectRateLimitEvent(entry, rateLimitEvents, seenRateLimitKeys, sessionIdFromFile);
     if (entry?.type !== 'assistant') continue;
     const message = entry.message;
     if (!message || typeof message !== 'object') continue;
@@ -99,7 +109,23 @@ export function parseTranscriptText(fileText, { projectDir, sessionFile }) {
     });
   }
 
-  return { usageRecords, webSearchCalls, malformedLineCount };
+  return { usageRecords, webSearchCalls, rateLimitEvents, malformedLineCount };
+}
+
+function collectRateLimitEvent(entry, rateLimitEvents, seenKeys, sessionIdFromFile) {
+  const info = entry?.apiErrorParams?.rate_limit_info;
+  if (!info || typeof info !== 'object' || typeof info.resetsAt !== 'number' || typeof entry.timestamp !== 'string') return;
+  const dedupeKey = entry.uuid || entry.requestId || `${entry.timestamp}:${info.resetsAt}`;
+  if (seenKeys.has(dedupeKey)) return;
+  seenKeys.add(dedupeKey);
+  rateLimitEvents.push({
+    dedupeKey,
+    timestamp: entry.timestamp,
+    sessionId: entry.sessionId || sessionIdFromFile,
+    status: typeof info.status === 'string' ? info.status : null,
+    resetsAt: info.resetsAt,
+    rateLimitType: typeof info.rateLimitType === 'string' ? info.rateLimitType : null,
+  });
 }
 
 function matchWebSearchResults(rawLine, pendingResults) {
@@ -158,11 +184,15 @@ function toCount(value) {
 export function mergeParsedFiles(parsedFiles) {
   const usageById = new Map();
   const searchById = new Map();
+  const rateLimitByKey = new Map();
   let malformedLineCount = 0;
   for (const parsed of parsedFiles) {
     malformedLineCount += parsed.malformedLineCount;
     for (const record of parsed.usageRecords) {
       if (!usageById.has(record.messageId)) usageById.set(record.messageId, record);
+    }
+    for (const event of parsed.rateLimitEvents || []) {
+      if (!rateLimitByKey.has(event.dedupeKey)) rateLimitByKey.set(event.dedupeKey, event);
     }
     for (const call of parsed.webSearchCalls) {
       const existing = searchById.get(call.toolUseId);
@@ -176,6 +206,7 @@ export function mergeParsedFiles(parsedFiles) {
   return {
     usageRecords: [...usageById.values()],
     webSearchCalls: [...searchById.values()],
+    rateLimitEvents: [...rateLimitByKey.values()],
     malformedLineCount,
   };
 }

@@ -4,6 +4,7 @@ import { aggregateClaudeUsage } from './aggregate.js';
 import { fetchAdminUsage } from './admin-api.js';
 import { loadPricingTable, priceUsageRecord } from './pricing.js';
 import { estimateClaudeQuota } from './quota.js';
+import { applyOfficialQuota, currentBlock, readStatuslineState } from './official-quota.js';
 import { loadClaudeQuotaConfig } from '../../config.js';
 
 // Per-message quota inputs. Synthetic (unpriced) messages are not API calls and
@@ -23,8 +24,19 @@ export function quotaEntries(usageRecords, pricingTable) {
   return entries;
 }
 
+// Latest real API response time; a rate-limit block older than this is over.
+export function lastResponseAt(usageRecords) {
+  let latestMs = null;
+  for (const usageRecord of usageRecords) {
+    if (usageRecord.model === '<synthetic>') continue;
+    const atMs = Date.parse(usageRecord.timestamp);
+    if (Number.isFinite(atMs) && (latestMs == null || atMs > latestMs)) latestMs = atMs;
+  }
+  return latestMs == null ? null : new Date(latestMs).toISOString();
+}
+
 export function createClaudeProvider({
-  pricingFilePath, adminKey, timeZone, fetchImpl, quotaConfig = loadClaudeQuotaConfig({}),
+  pricingFilePath, adminKey, timeZone, fetchImpl, quotaConfig = loadClaudeQuotaConfig({}), fileSystem,
 }) {
   let cachedAdminUsage = { configured: Boolean(adminKey), pending: true };
 
@@ -35,8 +47,14 @@ export function createClaudeProvider({
       const pricingTable = await loadPricingTable(pricingFilePath); // re-read so edits apply on refresh
       const transcripts = await context.getTranscripts();
       const { byDayUnroundedCostUsd, ...aggregate } = aggregateClaudeUsage(transcripts.usageRecords, { pricingTable, timeZone, now: context.now });
-      const quota = estimateClaudeQuota(quotaEntries(transcripts.usageRecords, pricingTable), {
+      const estimated = estimateClaudeQuota(quotaEntries(transcripts.usageRecords, pricingTable), {
         quotaConfig, now: context.now, timeZone,
+      });
+      // Official /usage percentages from the status line capture, per window.
+      const stateResult = await readStatuslineState(quotaConfig.statuslineStateFile, fileSystem);
+      const block = currentBlock(transcripts.rateLimitEvents, { now: context.now, lastResponseAt: lastResponseAt(transcripts.usageRecords) });
+      const quota = applyOfficialQuota(estimated, stateResult, {
+        now: context.now, maxAgeSeconds: quotaConfig.statuslineMaxAgeSeconds, block,
       });
       const { recentBlocks, ...quotaSummary } = quota;
 
@@ -63,7 +81,10 @@ export function createClaudeProvider({
         // Estimated plan-limit usage; see quota.js. Detail adds recent session blocks.
         quota: quotaSummary,
       };
-      if (quota.session.overLimit || quota.weekly.overLimit) {
+      if (block) {
+        summary.warnings.push(`Claude is rate-limited${block.rateLimitType ? ` (${block.rateLimitType.replace(/_/g, ' ')} limit)` : ''} until ${block.until}.`);
+      }
+      if ((quota.session.source === 'estimate' && quota.session.overLimit) || (quota.weekly.source === 'estimate' && quota.weekly.overLimit)) {
         summary.warnings.push('Estimated Claude usage is over a configured limit; recalibrate against /usage if Claude is not limiting you.');
       }
       if (cachedAdminUsage.configured && cachedAdminUsage.ok) {
