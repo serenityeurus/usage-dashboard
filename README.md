@@ -1,7 +1,7 @@
 # usage-dashboard
 
 A self-hosted dashboard for usage and spend across AI and API providers. It currently tracks **Claude**, **Brave Search** and **SearXNG** (self-hosted search).
-The main page starts with an **All platforms** tile (combined spend, tokens, searches and messages), followed by one tile per provider. Every tile shows **today**, **the last 7 days** and **all time**. Click a tile to open its breakdown. **Refresh** re-reads every source on the server.
+The main page starts with an **All platforms** tile (combined spend, tokens, searches and messages), followed by one tile per provider. Every tile shows **today**, **the last 7 days** and **all time**. Click a tile to open its breakdown. **Refresh** re-reads every source on the server; the server also re-reads them on its own every 5 minutes (configurable), and an open tab follows along. The Claude tile adds an **estimate** of how much of your plan's 5-hour session and weekly limits you have used.
 
 - Stack: Node 22 with no runtime dependencies (`node:http` plus `node:test`) and a vanilla JS/SVG frontend.
 - Runs in Docker as a non-root user with a read-only root filesystem, read-only data mounts and a healthcheck.
@@ -37,7 +37,12 @@ To run the tests: `npm test`.
 | `BRAVE_MONTHLY_CREDIT_USD` | `5` | Brave's free monthly credit. |
 | `BRAVE_QUOTA_MIN_INTERVAL_SECONDS` | `60` | Minimum gap between quota probes. |
 | `BRAVE_PROBE_ON_STARTUP` | `true` | Set to `false` to skip the probe at container start. |
-| `BRAVE_QUOTA_PROBE` | `auto` | `auto`: probe while `WEB_SEARCH_PROVIDER=brave`; otherwise (another provider, or unset) only on an explicit **Probe quota** click. `true`: every refresh. `false`: never. |
+| `BRAVE_QUOTA_PROBE` | `auto` | `auto`: probe while `WEB_SEARCH_PROVIDER=brave`; otherwise (another provider, or unset) only on an explicit **Probe quota** click. `true`: every startup/manual refresh. `false`: never. Auto refreshes never probe in any mode. |
+| `AUTO_REFRESH_SECONDS` | `300` | Server-side refresh interval; `0` disables. Must be an integer, `0` or at least `30`; anything else stops startup with an error. See [Auto refresh](#auto-refresh). |
+| `CLAUDE_QUOTA_METRIC` | `usd` | What the Claude plan-limit estimate measures: `usd` (API-equivalent cost) or `tokens` (all tokens, cache reads included). See [Claude: plan limits](#claude-plan-limits-estimate). |
+| `CLAUDE_SESSION_LIMIT_USD`, `CLAUDE_WEEKLY_LIMIT_USD` | empty | Your calibrated 5-hour and weekly limits in API-equivalent USD (used when the metric is `usd`). Empty = no limit for that window. |
+| `CLAUDE_SESSION_LIMIT_TOKENS`, `CLAUDE_WEEKLY_LIMIT_TOKENS` | empty | The same limits in tokens (used when the metric is `tokens`). |
+| `CLAUDE_WEEKLY_RESET` | `rolling` | `rolling` (trailing 7 days) or a weekly reset like `mon 00:00` / `thursday 17:30`, in `DASHBOARD_TIME_ZONE`. |
 
 Model prices live in `config/pricing.json`, in USD per million tokens. The file is mounted into the container and re-read on every refresh, so you can edit it without rebuilding.
 
@@ -82,6 +87,17 @@ The combined breakdown shows spend per day stacked by provider (each legend entr
   - Agent names come from the directory name: `…-openclaw-workspace-droid` → `droid`.
 - **Performance:** each file's parse result is cached and keyed by `mtime:size`, so a refresh only re-reads changed files. A cold scan of about 140 MB takes about 0.6 s in the container; an incremental refresh takes about 50 ms.
 
+### Claude: plan limits (estimate)
+
+Claude subscriptions have a rolling **5-hour session limit** and a **weekly limit**, but Anthropic publishes no token or dollar figures for them. The dashboard therefore only *estimates* usage against limits you supply, and labels every figure "estimate".
+
+- **What is measured:** the same deduplicated transcript records as the cost figures. `CLAUDE_QUOTA_METRIC=usd` (the default) sums API-equivalent cost; `tokens` sums all tokens. USD is the default because cache reads dominate raw token counts while costing a tenth of the input rate, so a token limit swings with cache behaviour. Unpriced models count tokens but no USD.
+- **Session window:** a window opens at the first message after the previous window expired and lasts 5 hours; the start is floored to the hour, matching the on-the-hour reset times Claude shows. It is a block, not a trailing 5 hours: steady use from 10:10 to 16:00 is two windows (10:00–15:00 and 15:00–20:00). When the latest window has expired, the session shows 0 and "the next message starts one". The tile shows the reset time.
+- **Weekly window:** `CLAUDE_WEEKLY_RESET=rolling` counts the trailing 7 days and shows when the oldest counted usage ages out. `mon 00:00` (any weekday, `HH:MM`) counts from the most recent such wall time in `DASHBOARD_TIME_ZONE` and shows the next reset; weeks spanning a DST change are 167 or 169 hours.
+- **Percent** = used ÷ limit. Bars cap at 100% visually; above that the figure is shown in red with ">100%" and a tile warning. A window with no limit shows usage only. With no limit set for the chosen metric the section reads "Not configured" and says which keys to set, but still shows current usage so you can calibrate.
+- **Calibration:** run `/usage` in Claude Code. If it shows the session at P% while the dashboard shows U used in the current window, set `CLAUDE_SESSION_LIMIT_USD` to U ÷ (P/100); repeat for the weekly figure, then `docker compose up -d`. Re-check now and then: limits vary by plan and model mix, and usage from claude.ai or other machines is invisible here but counts toward the real limit, so the estimate reads low when you use those.
+- **API:** `/api/summary` carries it as `quota` on the `claude` provider (`configured`, `metric`, `session { active, startAt, resetAt, used { usd, tokens, messages }, limit, percent, overLimit }`, `weekly { mode, startAt, resetAt, nextDropAt, … }`); `/api/providers/claude` adds `recentBlocks`, the last 10 session windows, also listed on the Claude page. Like other refresh-time figures it updates on the next refresh (auto, every 5 minutes by default).
+
 ### Claude: Admin API (optional)
 
 When `ANTHROPIC_ADMIN_KEY` is set, the dashboard calls `GET /v1/organizations/usage_report/messages` (`bucket_width=1d`, `group_by[]=model`) and `GET /v1/organizations/cost_report` for the last 30 days, following `has_more`/`next_page` pagination.
@@ -124,6 +140,12 @@ Brave has no usage API, so this provider combines two signals:
 **Estimated spend** = searches × `BRAVE_COST_PER_1K` / 1000. The monthly view subtracts the `BRAVE_MONTHLY_CREDIT_USD` credit.
 Pricing is $5 per 1,000 requests with $5 of free credit each month, per Brave's pricing page (<https://api-dashboard.search.brave.com/documentation/pricing>; the page renders client-side, so these figures were confirmed against its search snippet). Check them against your plan.
 
+### Auto refresh
+
+The server runs a refresh every `AUTO_REFRESH_SECONDS` (default 300; `0` turns it off), starting one interval after the startup refresh. A tick is skipped when a refresh is already running. Auto refreshes **never run the paid Brave quota probe**, whatever `BRAVE_QUOTA_PROBE` says; startup and the **Refresh** button keep their behaviour, and a manual Refresh that arrives during an auto run waits and runs its own so it can still probe. With the Admin API configured, each auto refresh also calls it (free, but it counts toward Anthropic's API rate limits).
+
+The interval is returned as `autoRefreshSeconds` in `/api/summary`, `/api/total` and `/api/providers/:id`. The page re-fetches the current view (GET only) on the same interval, aimed just after the server's next expected refresh, shows "auto-refresh every 5 min" next to the last-updated time, pauses while the tab is hidden and catches up as soon as it is visible again. A failed background fetch keeps the current view and notes the error in the header.
+
 ## Switching web search between SearXNG and Brave
 
 The OpenClaw gateway and the dashboard are configured separately. Change both.
@@ -156,11 +178,11 @@ If you expose the dashboard on the LAN (`BIND_ADDRESS=0.0.0.0`), add the name or
 | GET, HEAD | `/api/summary` | Cached tile summaries. Reads no sources. |
 | GET, HEAD | `/api/providers/:id` | Cached detail payload. |
 | GET, HEAD | `/api/total` | Cached All platforms roll-up: windows, spend and searches per provider per day, per-provider rows. |
-| POST | `/api/refresh` | Re-reads all sources, then returns the summary. Concurrent calls share one run. `?probe=brave` also runs the paid Brave quota probe. |
+| POST | `/api/refresh` | Re-reads all sources, then returns the summary. Concurrent calls share one run (but never join an auto run). `?probe=brave` also runs the paid Brave quota probe. |
 
 HEAD is answered wherever GET is (same status and headers, no body), as for the static files. Any other method on a known route, including `OPTIONS`, gets `405` with an `Allow` header; there is no CORS, so there is nothing for a preflight to negotiate. Unknown `/api/` paths get `404`.
 
-`/api/summary` returns `{ refreshedAt, timeZone, range: { today, weekStart }, total, providers[] }`. Each provider summary includes `costKind`, `active` (web search backends) and `windows: { range, metrics, today, last7Days, allTime }`.
+`/api/summary` returns `{ refreshedAt, refreshReason ('startup' | 'refresh' | 'auto'), autoRefreshSeconds, timeZone, range: { today, weekStart }, total, providers[] }`. Each provider summary includes `costKind`, `active` (web search backends) and `windows: { range, metrics, today, last7Days, allTime }`.
 
 ## Adding a provider
 
@@ -178,7 +200,8 @@ HEAD is answered wherever GET is (same status and headers, no body), as for the 
 - Brave estimates count every Brave-attributed call, including any that OpenClaw answered from its in-process result cache. No Brave results seen so far were marked as cached.
 - Attribution by cutover time is only as accurate as `WEB_SEARCH_PROVIDER_HISTORY`. It applies only to calls whose result records no provider.
 - The active-provider badge comes from `WEB_SEARCH_PROVIDER`, not from OpenClaw's live config, so it can drift if one is changed without the other. When unset, it is only as current as the last recorded search.
-- Windows roll over at midnight on the next API read, but an open page does not poll: reload or navigate to see the new day. Month-to-date figures (e.g. "Searches 2026-11") are still fixed at refresh time.
+- Windows roll over at midnight on the next API read; an open page re-fetches every `AUTO_REFRESH_SECONDS` (not at all when it is `0`). Month-to-date figures (e.g. "Searches 2026-11") and the Claude plan-limit estimate are fixed at refresh time.
+- Claude plan limits are estimates against limits you calibrate yourself. The window rules (block start floored to the hour, 5-hour length) follow Claude's described behaviour and its on-the-hour reset times, not a published algorithm; Anthropic can change them.
 - There is no authentication. Keep `BIND_ADDRESS=127.0.0.1` or put the dashboard behind a reverse proxy that handles auth.
 
 ## License

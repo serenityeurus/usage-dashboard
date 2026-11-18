@@ -30,6 +30,62 @@ function listFromEnv(environment, key) {
   return (environment[key] || '').split(',').map((part) => part.trim()).filter(Boolean);
 }
 
+// Seconds between server-side auto refreshes: an integer, 0 (off) or >= 30.
+// The floor keeps a typo like "5" (meant as minutes) from rescanning
+// transcripts every five seconds.
+export const MinAutoRefreshSeconds = 30;
+function autoRefreshSecondsFromEnv(environment) {
+  const rawValue = String(environment.AUTO_REFRESH_SECONDS ?? '').trim();
+  if (rawValue === '') return 300;
+  const seconds = Number(rawValue);
+  if (!/^\d+$/.test(rawValue) || !Number.isSafeInteger(seconds) || (seconds !== 0 && seconds < MinAutoRefreshSeconds)) {
+    throw new Error(`AUTO_REFRESH_SECONDS must be an integer, 0 (disabled) or >= ${MinAutoRefreshSeconds}, got "${environment.AUTO_REFRESH_SECONDS}"`);
+  }
+  return seconds;
+}
+
+// A positive limit, or null when unset. 0 is rejected: it would make every
+// percentage infinite, and "no limit" is spelled by leaving the key empty.
+function limitFromEnv(environment, key) {
+  const rawValue = String(environment[key] ?? '').trim();
+  if (rawValue === '') return null;
+  const numberValue = Number(rawValue);
+  if (!Number.isFinite(numberValue) || numberValue <= 0) {
+    throw new Error(`${key} must be a positive number (or empty for no limit), got "${environment[key]}"`);
+  }
+  return numberValue;
+}
+
+const WeekdayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+// CLAUDE_WEEKLY_RESET: "rolling" (trailing 7 days) or "<weekday> HH:MM" in the
+// dashboard time zone, e.g. "mon 00:00", "thursday 17:30". Weekdays need at
+// least three letters.
+export function parseWeeklyReset(rawValue) {
+  const value = String(rawValue ?? '').trim().toLowerCase();
+  if (value === '' || value === 'rolling') return { mode: 'rolling', label: 'rolling 7 days' };
+  const match = value.match(/^([a-z]{3,9})\s+(\d{1,2}):(\d{2})$/);
+  const dayOfWeek = match ? WeekdayNames.findIndex((name) => name.startsWith(match[1])) : -1;
+  const hour = match ? Number(match[2]) : NaN;
+  const minute = match ? Number(match[3]) : NaN;
+  if (dayOfWeek < 0 || !(hour <= 23) || !(minute <= 59)) {
+    throw new Error(`CLAUDE_WEEKLY_RESET must be "rolling" or "<weekday> HH:MM" (e.g. "mon 00:00"), got "${rawValue}"`);
+  }
+  const label = `${WeekdayNames[dayOfWeek].slice(0, 3)} ${String(hour).padStart(2, '0')}:${match[3]}`;
+  return { mode: 'fixed', dayOfWeek, hour, minute, label };
+}
+
+export function loadClaudeQuotaConfig(environment = {}) {
+  return {
+    metric: enumFromEnv(environment, 'CLAUDE_QUOTA_METRIC', ['usd', 'tokens'], 'usd'),
+    limits: {
+      session: { tokens: limitFromEnv(environment, 'CLAUDE_SESSION_LIMIT_TOKENS'), usd: limitFromEnv(environment, 'CLAUDE_SESSION_LIMIT_USD') },
+      weekly: { tokens: limitFromEnv(environment, 'CLAUDE_WEEKLY_LIMIT_TOKENS'), usd: limitFromEnv(environment, 'CLAUDE_WEEKLY_LIMIT_USD') },
+    },
+    weeklyReset: parseWeeklyReset(environment.CLAUDE_WEEKLY_RESET),
+  };
+}
+
 export function loadConfig(environment = process.env) {
   const rawTimeZone = environment.DASHBOARD_TIME_ZONE || environment.TZ || DefaultTimeZone;
   // POSIX allows a leading ":" (TZ=:America/Detroit) meaning "implementation-defined
@@ -81,5 +137,7 @@ export function loadConfig(environment = process.env) {
     probeBraveOnStartup: environment.BRAVE_PROBE_ON_STARTUP !== 'false',
     searxngBaseUrl,
     searxngTimeoutSeconds: numberFromEnv(environment, 'SEARXNG_TIMEOUT_SECONDS', 5),
+    autoRefreshSeconds: autoRefreshSecondsFromEnv(environment),
+    claudeQuota: loadClaudeQuotaConfig(environment),
   };
 }
