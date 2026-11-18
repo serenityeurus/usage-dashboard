@@ -52,7 +52,28 @@ export function resolvePaths(environment = process.env) {
   };
 }
 
-export function statusLineCommand({ nodePath = process.execPath, scriptPath } = {}) {
+// process.execPath is the resolved binary (e.g. Homebrew's versioned
+// /opt/homebrew/Cellar/node/26.13.0_2/bin/node, gone after `brew upgrade`).
+// Prefer the first `node` on PATH that is the same binary, usually a stable
+// symlink such as /opt/homebrew/bin/node.
+export function stableNodePath(execPath = process.execPath, searchPath = process.env.PATH || '') {
+  let target;
+  try {
+    target = fs.realpathSync(execPath);
+  } catch {
+    return execPath;
+  }
+  for (const directory of searchPath.split(path.delimiter)) {
+    if (!path.isAbsolute(directory)) continue;
+    const candidate = path.join(directory, 'node');
+    try {
+      if (fs.realpathSync(candidate) === target) return candidate;
+    } catch { /* not here */ }
+  }
+  return execPath;
+}
+
+export function statusLineCommand({ nodePath = stableNodePath(), scriptPath } = {}) {
   const resolvedScript = scriptPath || path.join(path.dirname(fileURLToPath(import.meta.url)), 'claude-statusline.mjs');
   return `${shellQuote(nodePath)} ${shellQuote(resolvedScript)}`;
 }

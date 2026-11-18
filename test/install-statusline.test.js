@@ -5,7 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { planChange, run, statusLineCommand } from '../scripts/install-statusline.mjs';
+import {
+  planChange, run, stableNodePath, statusLineCommand,
+} from '../scripts/install-statusline.mjs';
 
 const InstallerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'install-statusline.mjs');
 const OurCommand = '/opt/node/bin/node /repo/scripts/claude-statusline.mjs';
@@ -121,6 +123,21 @@ describe('install-statusline.mjs', () => {
   it('builds an absolute, shell-quoted command', () => {
     assert.equal(statusLineCommand({ nodePath: '/usr/bin/node', scriptPath: '/a b/claude-statusline.mjs' }), "/usr/bin/node '/a b/claude-statusline.mjs'");
     assert.match(statusLineCommand(), /^\/\S+node\S* \/\S+\/scripts\/claude-statusline\.mjs$/);
+  });
+
+  it('prefers a stable PATH symlink to the same node binary over the resolved execPath', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ud-node-'));
+    fs.mkdirSync(path.join(directory, 'cellar', '1.0', 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(directory, 'bin'));
+    const realNode = path.join(directory, 'cellar', '1.0', 'bin', 'node');
+    fs.writeFileSync(realNode, '');
+    fs.symlinkSync(realNode, path.join(directory, 'bin', 'node'));
+    fs.mkdirSync(path.join(directory, 'other'));
+    fs.writeFileSync(path.join(directory, 'other', 'node'), '');
+    const searchPath = ['relative', path.join(directory, 'other'), path.join(directory, 'bin')].join(path.delimiter);
+    assert.equal(stableNodePath(realNode, searchPath), path.join(directory, 'bin', 'node'));
+    assert.equal(stableNodePath(realNode, ''), realNode);
+    assert.equal(stableNodePath('/does/not/exist', searchPath), '/does/not/exist');
   });
 
   it('plans a non-command statusLine replacement without a chain command', () => {
